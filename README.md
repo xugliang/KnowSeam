@@ -2,15 +2,17 @@
 
 独立部署、通过 MCP 接入智能体的企业知识服务。核心不依赖 SuiteHarness、Codex、Claude Code 或 DeepSeek Harness。智能体负责理解问题和组织答案，KnowSeam 负责资料同步、检索、授权和可追溯证据。
 
+源码仓库：[xugliang/KnowSeam](https://github.com/xugliang/KnowSeam)。仓库名称为 **KnowSeam**；Python 包、命令和插件标识仍使用小写 `knowseam`。
+
 ## 能力与边界
 
 - 数据源：飞书 Wiki、显式授权的文件目录。ABC（抽象基类）连接器、解析器、向量模型、重排序模型接口支持扩展。
 - 解析：TXT/Markdown、DOCX、XLSX、PPTX、文本 PDF、已支持的飞书原生文档/表格。保留段落、单元格、幻灯片定位。
 - 存储：PostgreSQL + pgvector；原始材料内容寻址存档。不包含业务考核、客户数据、聊天记忆。
-- 检索：向量 + Jieba 分词后的 PostgreSQL 全文检索 → RRF 排名融合 → 重排序。不是 BM25。
+- 检索：向量 + Jieba 分词后的 BM25 → RRF 排名融合 → 重排序。BM25 使用 PostgreSQL 倒排词频表和标准公式，不依赖额外数据库扩展。
 - 增量：来源版本、正文 SHA-256、解析流水线指纹、分块哈希、向量缓存。失败不先删旧版本；完整扫描才判定删除；权限收回或过期后拒绝读取。
 - 接入：MCP Streamable HTTP、可选 stdio 远程桥接、可选 SuiteHarness 原生适配器。员工电脑不运行数据库或索引任务。
-- 权限：首版仅收录核验过的全员可读材料，支持集合级控制；尚未实现飞书任意部门/员工级权限同步。
+- 权限：集合支持全员／部门／指定员工三层授权，召回前过滤、读原文及重排序后复核。来源仍须经过发布范围核验；不自动同步飞书私有文档 ACL。详见 [权限与 BM25 运维](docs/BM25-ACCESS.md)。
 
 不支持扫描件/图片 OCR、图片语义、音视频、旧二进制 Office、任意原生多维表格/Slides；不执行 Office 宏。资料不足时返回无依据，不编造全文。
 
@@ -32,6 +34,8 @@
 Python 3.11+，独立 PostgreSQL/pgvector。业务配置只来自 JSON 文件。
 
 ```bash
+git clone https://github.com/xugliang/KnowSeam.git
+cd KnowSeam
 python -m venv .venv
 .venv/bin/python -m pip install -e '.[mcp,test]'
 cp config.example.json config.local.json

@@ -62,6 +62,16 @@ class _Strict(BaseModel):
 class CollectionConfig(_Strict):
     id: Identifier
     title: Annotated[str, Field(strict=True, min_length=1, max_length=256)]
+    visibility: Literal["company", "department", "employee"] = "company"
+    departments: Annotated[tuple[Identifier, ...], Field(max_length=10000)] = ()
+    employees: Annotated[tuple[Identifier, ...], Field(max_length=10000)] = ()
+
+    @model_validator(mode="after")
+    def validate_grants(self):
+        if ((self.visibility != "department" and self.departments)
+                or (self.visibility != "employee" and self.employees)):
+            raise ValueError("grants must match collection visibility")
+        return self
 
     @field_validator("title")
     @classmethod
@@ -69,6 +79,12 @@ class CollectionConfig(_Strict):
         if not value.strip():
             raise ValueError("collection title must not be blank")
         return value
+
+
+class EmployeeConfig(_Strict):
+    actor_id: Identifier
+    active: Annotated[bool, Field(strict=True)] = True
+    departments: Annotated[tuple[Identifier, ...], Field(max_length=1000)] = ()
 
 
 class ModelConfig(_Strict):
@@ -217,6 +233,7 @@ class Settings(_Strict):
     file_root: Path
     company_id: Identifier
     collections: Annotated[tuple[CollectionConfig, ...], Field(min_length=1, max_length=1000)]
+    employees: Annotated[tuple[EmployeeConfig, ...], Field(max_length=10000)] = ()
     clients: Annotated[tuple[ServiceClient, ...], Field(min_length=1, max_length=1000)]
     models: ModelsConfig
     tokenization: TokenizationConfig = Field(default_factory=TokenizationConfig)
@@ -254,6 +271,8 @@ class Settings(_Strict):
         collections = {item.id for item in self.collections}
         if len(collections) != len(self.collections):
             raise ValueError("collection ids must be unique")
+        if len({item.actor_id for item in self.employees}) != len(self.employees):
+            raise ValueError("employee ids must be unique")
         if len({item.id for item in self.sources}) != len(self.sources):
             raise ValueError("source ids must be unique")
         if any(source.collection_id not in collections for source in self.sources):

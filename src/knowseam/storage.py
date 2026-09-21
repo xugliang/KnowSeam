@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -47,6 +48,25 @@ CREATE TABLE IF NOT EXISTS sk_embedding_cache (
  model_id text NOT NULL, dimensions integer NOT NULL, input_hash text NOT NULL,
  embedding vector NOT NULL, PRIMARY KEY(model_id,dimensions,input_hash));
 ALTER TABLE sk_sources ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true;
+ALTER TABLE sk_collections ADD COLUMN IF NOT EXISTS visibility text NOT NULL DEFAULT 'company'
+ CHECK (visibility IN ('company','department','employee'));
+CREATE TABLE IF NOT EXISTS sk_employees (
+ company_id text NOT NULL, actor_id text NOT NULL, active boolean NOT NULL,
+ PRIMARY KEY(company_id,actor_id));
+CREATE TABLE IF NOT EXISTS sk_employee_departments (
+ company_id text NOT NULL, actor_id text NOT NULL, department_id text NOT NULL,
+ PRIMARY KEY(company_id,actor_id,department_id),
+ FOREIGN KEY(company_id,actor_id) REFERENCES sk_employees(company_id,actor_id));
+CREATE TABLE IF NOT EXISTS sk_collection_grants (
+ collection_id text NOT NULL REFERENCES sk_collections(id),
+ kind text NOT NULL CHECK (kind IN ('department','employee')), subject_id text NOT NULL,
+ PRIMARY KEY(collection_id,kind,subject_id));
+ALTER TABLE sk_chunks ADD COLUMN IF NOT EXISTS token_count integer CHECK (token_count >= 0);
+CREATE TABLE IF NOT EXISTS sk_chunk_terms (
+ version_id text NOT NULL, chunk_id text NOT NULL, term text NOT NULL, tf integer NOT NULL CHECK(tf>0),
+ PRIMARY KEY(version_id,chunk_id,term),
+ FOREIGN KEY(version_id,chunk_id) REFERENCES sk_chunks(version_id,chunk_id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS sk_chunk_terms_lookup ON sk_chunk_terms(term,version_id,chunk_id) INCLUDE(tf);
 """
 
 
@@ -81,13 +101,21 @@ class PostgresStore:
     def ready(self) -> bool:
         try:
             with self.connect() as connection:
-                connection.execute("SELECT 1 FROM sk_collections LIMIT 1")
+                connection.execute("SELECT visibility FROM sk_collections LIMIT 1")
+                connection.execute("SELECT tf FROM sk_chunk_terms LIMIT 1")
+                if connection.execute("SELECT 1 FROM sk_chunks ch JOIN sk_documents d ON d.active_version=ch.version_id "
+                                      "JOIN sk_sources s ON s.id=d.source_id "
+                                      "WHERE s.enabled AND d.public AND ch.token_count IS NULL LIMIT 1").fetchone():
+                    return False
             return True
         except psycopg.Error:
             return False
 
-    def configure(self, *, company_id: str, collections: Sequence[dict], sources: Sequence[dict]) -> None:
+    def configure(self, *, company_id: str, collections: Sequence[dict], sources: Sequence[dict],
+                  employees: Sequence[dict] = ()) -> None:
         with self.connect() as c:
+            # Serialize policy replacement, including deployments with no sources.
+            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("acl:" + company_id,))
             existing = c.execute("SELECT s.id FROM sk_sources s JOIN sk_collections k ON k.id=s.collection_id "
                                  "WHERE k.company_id=%s", (company_id,)).fetchall()
             for source_id in sorted({r["id"] for r in existing} | {r["id"] for r in sources}):
@@ -98,9 +126,27 @@ class PostgresStore:
                 old = c.execute("SELECT company_id FROM sk_collections WHERE id=%s", (item["id"],)).fetchone()
                 if old and old["company_id"] != company_id:
                     raise AccessDenied("collection company cannot be reassigned")
-                c.execute("INSERT INTO sk_collections(id,company_id,title) VALUES(%s,%s,%s) "
-                          "ON CONFLICT(id) DO UPDATE SET title=excluded.title",
-                          (item["id"], company_id, item["title"]))
+                visibility = item.get("visibility", "company")
+                if visibility not in {"company", "department", "employee"}:
+                    raise ValueError("invalid collection visibility")
+                c.execute("INSERT INTO sk_collections(id,company_id,title,visibility) VALUES(%s,%s,%s,%s) "
+                          "ON CONFLICT(id) DO UPDATE SET title=excluded.title,visibility=excluded.visibility",
+                          (item["id"], company_id, item["title"], visibility))
+                c.execute("DELETE FROM sk_collection_grants WHERE collection_id=%s", (item["id"],))
+                for kind, field in (("department", "departments"), ("employee", "employees")):
+                    for subject in set(item.get(field, ())):
+                        if kind != visibility:
+                            raise ValueError("grant does not match visibility")
+                        c.execute("INSERT INTO sk_collection_grants VALUES(%s,%s,%s)", (item["id"], kind, subject))
+            c.execute("DELETE FROM sk_employee_departments WHERE company_id=%s", (company_id,))
+            c.execute("UPDATE sk_employees SET active=false WHERE company_id=%s", (company_id,))
+            for employee in employees:
+                c.execute("INSERT INTO sk_employees VALUES(%s,%s,%s) ON CONFLICT(company_id,actor_id) "
+                          "DO UPDATE SET active=excluded.active",
+                          (company_id, employee["actor_id"], employee.get("active", True)))
+                for department in set(employee.get("departments", ())):
+                    c.execute("INSERT INTO sk_employee_departments VALUES(%s,%s,%s)",
+                              (company_id, employee["actor_id"], department))
             for item in sources:
                 old = c.execute("SELECT * FROM sk_sources WHERE id=%s", (item["id"],)).fetchone()
                 if old and old["collection_id"] != item["collection_id"]:
@@ -216,9 +262,40 @@ class PostgresStore:
                            chunk.content_hash, Jsonb(chunk.locator), tokens, vector))
                 c.execute("INSERT INTO sk_embedding_cache(model_id,dimensions,input_hash,embedding) VALUES(%s,%s,%s,%s::vector) "
                           "ON CONFLICT DO NOTHING", (model_id, dimensions, chunk.content_hash, vector))
+                self._index_terms(c, version_id, chunk.chunk_id, tokens.split())
             c.execute("UPDATE sk_documents SET active_version=%s,source_revision=%s,status='ready',error_code=NULL WHERE id=%s",
                       (version_id, node.revision, doc_id))
         return version_id
+
+    @staticmethod
+    def _index_terms(c, version_id: str, chunk_id: str, tokens: Sequence[str]) -> None:
+        counts = Counter(tokens)
+        c.execute("DELETE FROM sk_chunk_terms WHERE version_id=%s AND chunk_id=%s", (version_id, chunk_id))
+        if counts:
+            with c.cursor() as cursor:
+                cursor.executemany("INSERT INTO sk_chunk_terms VALUES(%s,%s,%s,%s)",
+                                   [(version_id, chunk_id, term, tf) for term, tf in counts.items()])
+        c.execute("UPDATE sk_chunks SET token_count=%s WHERE version_id=%s AND chunk_id=%s",
+                  (len(tokens), version_id, chunk_id))
+
+    def backfill_bm25(self, tokenizer, *, company_id: str, batch_size: int = 100) -> int:
+        """Resumable active-version migration; never downloads or re-embeds documents."""
+        if not 1 <= batch_size <= 1000:
+            raise ValueError("invalid migration batch size")
+        migrated = 0
+        while True:
+            with self.connect() as c:
+                rows = c.execute("SELECT ch.version_id,ch.chunk_id,ch.embedding_text FROM sk_chunks ch "
+                    "JOIN sk_versions v ON v.id=ch.version_id JOIN sk_documents d ON d.active_version=v.id "
+                    "JOIN sk_sources s ON s.id=d.source_id JOIN sk_collections k ON k.id=s.collection_id "
+                    "WHERE k.company_id=%s AND ch.token_count IS NULL "
+                    "ORDER BY ch.version_id,ch.chunk_id LIMIT %s FOR UPDATE OF ch",
+                    (company_id, batch_size)).fetchall()
+                for row in rows:
+                    self._index_terms(c, row["version_id"], row["chunk_id"], tokenizer.tokenize(row["embedding_text"]))
+                migrated += len(rows)
+            if not rows:
+                return migrated
 
     def _collections(self, principal: Principal, requested: Sequence[str] | None) -> list[str]:
         if not principal.actor_id or not principal.company_id or not principal.product_id:
@@ -229,16 +306,28 @@ class PostgresStore:
         return selected
 
     def collections(self, principal: Principal) -> list[dict]:
-        selected = self._collections(principal, None)
+        acl, args = self._collection_acl(principal, None)
         with self.connect() as c:
-            return c.execute("SELECT id,title FROM sk_collections WHERE company_id=%s AND id=ANY(%s::text[]) ORDER BY id",
-                             (principal.company_id, selected)).fetchall()
+            return c.execute("SELECT k.id,k.title FROM sk_collections k WHERE " + acl + " ORDER BY k.id", args).fetchall()
+
+    def _collection_acl(self, principal: Principal, requested: Sequence[str] | None) -> tuple[str, tuple]:
+        selected = self._collections(principal, requested)
+        return ("k.company_id=%s AND k.id=ANY(%s::text[]) "
+            "AND NOT EXISTS (SELECT 1 FROM sk_employees e WHERE e.company_id=k.company_id "
+            "AND e.actor_id=%s AND NOT e.active) "
+            "AND (k.visibility='company' OR EXISTS (SELECT 1 FROM sk_collection_grants g "
+            "WHERE g.collection_id=k.id AND g.kind=k.visibility AND "
+            "((g.kind='employee' AND g.subject_id=%s) OR (g.kind='department' AND EXISTS "
+            "(SELECT 1 FROM sk_employee_departments ed JOIN sk_employees e "
+            "ON e.company_id=ed.company_id AND e.actor_id=ed.actor_id AND e.active "
+            "WHERE ed.company_id=k.company_id AND ed.actor_id=%s AND ed.department_id=g.subject_id)))))",
+            (principal.company_id, selected, principal.actor_id, principal.actor_id, principal.actor_id))
 
     def _acl(self, principal: Principal, requested: Sequence[str] | None) -> tuple[str, tuple]:
-        selected = self._collections(principal, requested)
-        return ("k.company_id=%s AND k.id=ANY(%s::text[]) AND s.enabled=true AND d.public=true "
+        acl, args = self._collection_acl(principal, requested)
+        return (acl + " AND s.enabled=true AND d.public=true "
                 "AND d.status IN ('ready','stale') AND d.acl_verified_at >= %s",
-                (principal.company_id, selected, datetime.now(timezone.utc) - timedelta(seconds=self.acl_ttl_seconds)))
+                (*args, datetime.now(timezone.utc) - timedelta(seconds=self.acl_ttl_seconds)))
 
     def retrieve(self, principal: Principal, requested: Sequence[str] | None, *, vector: Sequence[float],
                  model_id: str, dimensions: int, tokens: Sequence[str], limit: int = 40) -> tuple[list[SearchHit], list[SearchHit]]:
@@ -254,14 +343,38 @@ class PostgresStore:
         with self.connect() as c:
             # Same transaction snapshot for both channels; authorization is in each SQL query, never post-filtered.
             c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            if c.execute("SELECT 1 FROM sk_chunks ch JOIN sk_versions v ON v.id=ch.version_id "
+                         "JOIN sk_documents d ON d.active_version=v.id JOIN sk_sources s ON s.id=d.source_id "
+                         "JOIN sk_collections k ON k.id=s.collection_id WHERE " + acl +
+                         " AND ch.token_count IS NULL LIMIT 1", args).fetchone():
+                raise RuntimeError("bm25_index_migration_required")
             dense = c.execute(base.format(score="1-(ch.embedding <=> %s::vector)", extra=""),
                               (vector_literal(vector, dimensions), *args, model_id, dimensions, limit)).fetchall()
             lexical: list[dict] = []
             if tokens:
-                query = " | ".join("'" + token.replace("'", "''").replace("\\", "\\\\") + "'" for token in tokens[:100])
-                lexical = c.execute(base.format(score="ts_rank_cd(ch.tokens,to_tsquery('simple',%s))",
-                                                extra="AND ch.tokens @@ to_tsquery('simple',%s)"),
-                                    (query, *args, model_id, dimensions, query, limit)).fetchall()
+                # N, df and average length are computed ONLY over authorized active
+                # chunks. Hidden documents cannot affect a user's BM25 scores.
+                lexical = c.execute("WITH eligible AS MATERIALIZED ("
+                    "SELECT ch.version_id,ch.chunk_id,ch.token_count FROM sk_chunks ch "
+                    "JOIN sk_versions v ON v.id=ch.version_id "
+                    "JOIN sk_documents d ON d.id=v.document_id AND d.active_version=v.id "
+                    "JOIN sk_sources s ON s.id=d.source_id JOIN sk_collections k ON k.id=s.collection_id "
+                    "WHERE " + acl + " AND v.model_id=%s AND v.dimensions=%s AND ch.token_count IS NOT NULL), "
+                    "stats AS (SELECT count(*)::float8 AS n,avg(token_count)::float8 AS avgdl FROM eligible), "
+                    "matches AS MATERIALIZED (SELECT t.*,e.token_count FROM sk_chunk_terms t "
+                    "JOIN eligible e USING(version_id,chunk_id) WHERE t.term=ANY(%s::text[])), "
+                    "df AS (SELECT term,count(*)::float8 AS n FROM matches GROUP BY term), "
+                    "ranked AS (SELECT m.version_id,m.chunk_id,"
+                    "sum(ln(1+(s.n-d.n+0.5)/(d.n+0.5))*m.tf*2.2/"
+                    "(m.tf+1.2*(0.25+0.75*m.token_count/nullif(s.avgdl,0))))::float8 AS score "
+                    "FROM matches m JOIN df d USING(term) CROSS JOIN stats s "
+                    "GROUP BY m.version_id,m.chunk_id ORDER BY score DESC,m.chunk_id,m.version_id LIMIT %s) "
+                    "SELECT d.id AS document_id,v.id AS version_id,ch.chunk_id,s.collection_id,"
+                    "d.title,ch.text,d.source_url,ch.locator,(d.status='stale') AS stale,r.score "
+                    "FROM ranked r JOIN sk_chunks ch USING(version_id,chunk_id) "
+                    "JOIN sk_versions v ON v.id=ch.version_id JOIN sk_documents d ON d.id=v.document_id "
+                    "JOIN sk_sources s ON s.id=d.source_id ORDER BY r.score DESC,ch.chunk_id,v.id",
+                    (*args, model_id, dimensions, list(dict.fromkeys(tokens))[:100], limit)).fetchall()
         return [SearchHit(**row) for row in dense], [SearchHit(**row) for row in lexical]
 
     def revalidate_hits(self, principal: Principal, hits: Sequence[SearchHit]) -> list[SearchHit]:

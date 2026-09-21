@@ -5,8 +5,9 @@
   "company_id": "company",
   "tokenization": {"terms": [], "user_dictionary": null},
   "collections": [
-    {"id": "company-public", "title": "公司全员公开知识"}
+    {"id": "company-public", "title": "公司全员公开知识", "visibility": "company"}
   ],
+  "employees": [],
   "clients": [
     {
       "token": "REPLACE_ME_WITH_A_UNIQUE_RANDOM_SERVICE_TOKEN_AT_LEAST_32_CHARS",

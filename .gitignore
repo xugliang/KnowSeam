@@ -25,3 +25,6 @@ build/
 dist/
 *.log
 deployment/runtime.env
+backups/
+*.private.json
+deployment/compose.server-bm25.yaml

@@ -32,6 +32,7 @@ def configure_store(store: PostgresStore, settings: Settings) -> None:
     store.configure(
         company_id=settings.company_id,
         collections=[item.model_dump(mode="json") for item in settings.collections],
+        employees=[item.model_dump(mode="json") for item in settings.employees],
         sources=[{"id": source.id, "collection_id": source.collection_id,
                   "config_hash": source_config_hash(source)} for source in settings.sources],
     )
@@ -141,6 +142,11 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
         from .tokenization import JiebaTokenizer
         tokenizer = JiebaTokenizer(user_dictionary=settings.tokenization.user_dictionary,
                                    terms=settings.tokenization.terms)
+        if args.command == "migrate-bm25":
+            await asyncio.to_thread(store.initialize)
+            count = await asyncio.to_thread(store.backfill_bm25, tokenizer, company_id=settings.company_id)
+            _print({"bm25_chunks_migrated": count})
+            return 0
         embedder = build_model(settings.models.embedding, embedding=True)
         resources.push_async_callback(_close_resource, embedder)
 
@@ -197,6 +203,7 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("init-db", help="初始化独立数据库及集合配置，不加载模型")
     commands.add_parser("status", help="只读检查数据库状态，不加载模型")
+    commands.add_parser("migrate-bm25", help="为现有活动分块补建 BM25 倒排索引，不调用模型")
     commands.add_parser("check-models", help="执行非敏感真实模型推理，失败不返回就绪")
     sync = commands.add_parser("sync", help="执行一次增量同步")
     sync.add_argument("--force", action="store_true", help="重新获取全文校验，仍复用相同内容的嵌入缓存")

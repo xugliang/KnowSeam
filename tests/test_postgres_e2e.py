@@ -209,6 +209,83 @@ def test_real_sync_retrieve_rerank_read_preserves_citations_and_pg_lexical(case)
     assert any("TEST-00000001" in item.text for item in lexical)
 
 
+def policy(case, visibility, subjects=(), employees=()):
+    collection = {"id": case.collection, "title": "授权资料", "visibility": visibility}
+    if visibility != "company":
+        collection["departments" if visibility == "department" else "employees"] = subjects
+    case.store.configure(company_id=case.company, collections=[collection], employees=employees,
+                         sources=[{"id": case.source, "collection_id": case.collection,
+                                   "config_hash": case.config_hash}])
+
+
+@pytest.mark.parametrize("visibility", ["department", "employee"])
+def test_restricted_acl_filters_both_channels_listing_read_and_revocation(case, visibility):
+    case.sync()
+    actor = case.principal.actor_id
+    subjects = ["sales"] if visibility == "department" else [actor]
+    employees = [{"actor_id": actor, "departments": ["sales"]}]
+    policy(case, visibility, subjects, employees)
+    assert case.search()["hits"]
+    assert case.read()["sections"]
+    outsider = replace(case.principal, actor_id="another-employee")
+    assert case.store.collections(outsider) == []
+    dense, lexical = case.store.retrieve(outsider, None, vector=[1, .2, .1], dimensions=3,
+        model_id=case.embedder.model_id, tokens=["示例产品"])
+    assert dense == lexical == []
+    before = len(case.embedder.calls), len(case.reranker.calls)
+    assert case.search(principal=outsider)["evidence_status"] == "no_accessible_collection"
+    assert before == (len(case.embedder.calls), len(case.reranker.calls))
+    with pytest.raises(NotFound):
+        case.read(principal=outsider)
+    case.reranker.on_score = lambda: policy(case, visibility, (), employees)
+    assert not case.search()["hits"]
+    assert not case.store.collections(case.principal)
+
+
+def test_public_unchanged_but_disabled_employee_denied_and_no_cross_company(case):
+    case.sync()
+    assert case.search(principal=replace(case.principal, actor_id="new-employee"))["hits"]
+    policy(case, "company", employees=[{"actor_id": case.principal.actor_id, "active": False}])
+    assert case.store.collections(case.principal) == []
+    assert case.store.collections(replace(case.principal, company_id="another-company")) == []
+    with pytest.raises(NotFound):
+        case.read()
+
+
+def test_bm25_matches_reference_formula_and_migration_is_idempotent(case, tokenizer):
+    import math
+    from collections import Counter
+    case.write("alpha alpha beta")
+    case.write("alpha gamma gamma gamma gamma", "second.md")
+    case.sync()
+    with case.store.connect() as c:
+        rows = c.execute("SELECT ch.* FROM sk_chunks ch JOIN sk_documents d ON d.active_version=ch.version_id "
+                         "WHERE d.source_id=%s", (case.source,)).fetchall()
+    assert len(rows) == 2
+    counts = [Counter(tokenizer.tokenize(row["embedding_text"])) for row in rows]
+    avgdl = sum(sum(c.values()) for c in counts) / len(counts)
+    df = sum(c["alpha"] > 0 for c in counts)
+    expected = {}
+    for row, count in zip(rows, counts):
+        tf = count["alpha"]
+        expected[row["chunk_id"]] = math.log(1+(len(rows)-df+.5)/(df+.5))*tf*2.2/(tf+1.2*(.25+.75*sum(count.values())/avgdl))
+    _, lexical = case.store.retrieve(case.principal, None, vector=[1, .2, .1], dimensions=3,
+                                    model_id=case.embedder.model_id, tokens=["alpha", "alpha"])
+    assert len(lexical) == 2
+    for hit in lexical:
+        assert hit.score == pytest.approx(expected[hit.chunk_id])
+    before = len(case.embedder.calls)
+    with case.store.connect() as c:
+        c.execute("UPDATE sk_chunks SET token_count=NULL WHERE version_id=ANY(%s::text[])",
+                  ([row["version_id"] for row in rows],))
+    assert case.store.backfill_bm25(tokenizer, company_id=case.company, batch_size=1) == 2
+    assert case.store.backfill_bm25(tokenizer, company_id=case.company) == 0
+    assert len(case.embedder.calls) == before
+    _, after = case.store.retrieve(case.principal, None, vector=[1, .2, .1], dimensions=3,
+                                  model_id=case.embedder.model_id, tokens=["alpha"])
+    assert [(x.chunk_id, x.score) for x in after] == [(x.chunk_id, x.score) for x in lexical]
+
+
 def test_unchanged_sync_does_not_reembed_or_make_new_version(case):
     case.sync()
     before = len(case.embedder.calls)
