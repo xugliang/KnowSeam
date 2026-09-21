@@ -1,0 +1,51 @@
+{
+  "environment": "production",
+  "dsn": "postgresql://knowseam:REPLACE_WITH_DATABASE_PASSWORD@127.0.0.1:18791/knowseam",
+  "file_root": "/app/data",
+  "company_id": "company",
+  "tokenization": {"terms": [], "user_dictionary": null},
+  "collections": [
+    {"id": "company-public", "title": "公司全员公开知识"}
+  ],
+  "clients": [
+    {
+      "token": "REPLACE_ME_WITH_A_UNIQUE_RANDOM_SERVICE_TOKEN_AT_LEAST_32_CHARS",
+      "product_id": "knowledge-agent",
+      "company_id": "company",
+      "allowed_collections": ["company-public"],
+      "actor_ids": []
+    }
+  ],
+  "models": {
+    "embedding": {
+      "backend": "http",
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "model_revision": "",
+      "base_url": "http://127.0.0.1:18792",
+      "api_key": "",
+      "dimensions": 1024,
+      "timeout": 120,
+      "allow_online": false
+    },
+    "reranker": {
+      "backend": "http",
+      "model_id": "Qwen/Qwen3-Reranker-0.6B",
+      "model_revision": "",
+      "base_url": "http://127.0.0.1:18792",
+      "api_key": "",
+      "timeout": 120,
+      "allow_online": false
+    }
+  },
+  "sources": [
+    {
+      "type": "filesystem",
+      "id": "controlled-import",
+      "collection_id": "company-public",
+      "root": "/imports",
+      "public_files": []
+    }
+  ],
+  "sync_interval_seconds": 300,
+  "acl_ttl_seconds": 900
+}

@@ -1,0 +1,22 @@
+{
+  "purpose": "FORMAT EXAMPLE ONLY. Replace placeholder document IDs with reviewed company ground truth before a real quality evaluation.",
+  "run_kind": "unverified",
+  "k": 10,
+  "cases": [
+    {
+      "query": "Kino 的开票入口在哪里？",
+      "expected_document_ids": ["REPLACE_WITH_ACTUAL_INVOICE_DOCUMENT_ID"],
+      "collection_ids": ["REPLACE_WITH_AUTHORIZED_COLLECTION_ID"]
+    },
+    {
+      "query": "智标宝的账号权限规则和项目协作规则分别是什么？",
+      "expected_document_ids": ["REPLACE_WITH_ACTUAL_ACCOUNT_DOCUMENT_ID", "REPLACE_WITH_ACTUAL_PROJECT_DOCUMENT_ID"],
+      "collection_ids": ["REPLACE_WITH_AUTHORIZED_COLLECTION_ID"]
+    },
+    {
+      "query": "不存在的产品 ZZZ-NO-SUCH-PRODUCT-EXAMPLE 的火星仓库地址是什么？",
+      "expected_document_ids": [],
+      "collection_ids": ["REPLACE_WITH_AUTHORIZED_COLLECTION_ID"]
+    }
+  ]
+}

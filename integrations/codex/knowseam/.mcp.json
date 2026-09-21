@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "knowseam": {
+      "command": "python",
+      "args": ["-m", "knowseam.bridge", "--config", "/absolute/private/knowseam-client.json"]
+    }
+  }
+}

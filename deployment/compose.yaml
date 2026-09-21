@@ -1,0 +1,47 @@
+name: knowseam
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+    image: knowseam:0.1.0
+    command: ["--config", "/private/core.json", "serve", "--host", "0.0.0.0", "--port", "18790"]
+    ports: ["127.0.0.1:18790:18790"]
+    volumes: ["../secrets/core.json:/private/core.json:ro"]
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    cpus: 1
+    pids_limit: 128
+    restart: unless-stopped
+  worker:
+    image: knowseam:0.1.0
+    command: ["--config", "/private/core.json", "worker"]
+    volumes:
+      - ../secrets/core.json:/private/core.json:ro
+      - ../data:/app/data
+      - ../imports:/imports:ro
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    cpus: 1
+    pids_limit: 128
+    restart: unless-stopped
+  mcp:
+    image: knowseam:0.1.0
+    entrypoint: ["python", "-m", "knowseam.mcp_server"]
+    command: ["--config", "/private/mcp.json"]
+    ports: ["127.0.0.1:18793:18793"]
+    volumes: ["../secrets/mcp.json:/private/mcp.json:ro"]
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped

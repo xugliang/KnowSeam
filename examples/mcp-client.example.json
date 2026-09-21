@@ -1,0 +1,5 @@
+{
+  "url": "https://knowledge.example.com/mcp",
+  "token": "REPLACE_WITH_YOUR_PERSONAL_RANDOM_TOKEN",
+  "allow_insecure_http": false
+}

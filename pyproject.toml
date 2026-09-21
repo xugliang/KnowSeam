@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowseam"
+version = "0.1.0"
+license = "MIT"
+readme = "README.md"
+description = "Source-backed enterprise knowledge service with MCP and optional agent adapters"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27,<1", "pydantic>=2.7,<3", "starlette>=0.41,<1", "uvicorn>=0.30,<1", "psycopg[binary]>=3.2,<4", "jieba==0.42.1", "openpyxl>=3.1,<4", "python-pptx>=1.0,<2", "python-docx>=1.1,<2", "pypdf>=5,<7"]
+
+[project.optional-dependencies]
+mcp = ["mcp==2.2.0"]
+suiteharness = ["jsonschema>=4.20,<5"]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1"]
+models = ["torch>=2.6,<3", "transformers>=4.51,<5", "sentence-transformers>=3.4,<6"]
+
+[project.scripts]
+knowseam = "knowseam.cli:main"
+knowseam-mcp = "knowseam.mcp_server:main"
+knowseam-bridge = "knowseam.bridge:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -1,0 +1,19 @@
+{
+  "name": "knowseam",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "企业知识库只读检索，返回可追溯的来源与原文。需配置公司 KnowSeam 服务。",
+  "author": {
+    "name": "KnowSeam contributors"
+  },
+  "interface": {
+    "displayName": "KnowSeam 企业知识库",
+    "shortDescription": "检索公司资料并引用来源",
+    "longDescription": "连接公司部署的 KnowSeam 服务，只读查询授权知识集合，不在员工电脑部署数据库或模型。安装前按接入文档配置服务地址与个人凭据。",
+    "developerName": "KnowSeam contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": ["列出我可查询的公司知识集合", "检索公司资料并注明来源"]
+  },
+  "mcpServers": "./.mcp.json"
+}

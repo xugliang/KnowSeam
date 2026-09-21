@@ -1,0 +1,16 @@
+{
+  "upstream_url": "http://127.0.0.1:18790",
+  "upstream_token": "REPLACE_WITH_BACKEND_ONLY_RANDOM_TOKEN",
+  "allow_insecure_http": true,
+  "host": "127.0.0.1",
+  "port": 18793,
+  "allowed_hosts": ["localhost:*", "127.0.0.1:*", "knowledge.example.com"],
+  "allowed_origins": ["https://knowledge.example.com"],
+  "bindings": [{
+    "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "actor_id": "employee-001",
+    "company_id": "company",
+    "product_id": "knowledge-agent",
+    "allowed_collections": ["company-public"]
+  }]
+}
