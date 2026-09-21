@@ -1,7 +1,7 @@
 """Real SuiteHarness registry/executor contracts; no LLM or external network.
 
 Set SUITEHARNESS_SOURCE_PATH to the directory containing ``suiteharness`` when
-testing a source checkout. The adjacent verified snapshot is a local default.
+testing a source checkout; no private workspace path is assumed.
 """
 
 from __future__ import annotations
@@ -11,18 +11,14 @@ import json
 import os
 import sys
 from functools import wraps
-from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import BaseModel
 
-_snapshot = Path(__file__).resolve().parents[2] / "assessment-reliability-20260920" / "harness"
 _harness_source = os.environ.get("SUITEHARNESS_SOURCE_PATH")
 if _harness_source:
     sys.path.insert(0, _harness_source)
-elif _snapshot.is_dir():
-    sys.path.insert(0, str(_snapshot))
 
 pytest.importorskip("suiteharness", reason="optional plugin tests require the real SuiteHarness source/package")
 

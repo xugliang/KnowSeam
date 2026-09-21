@@ -1,4 +1,3 @@
-"""Independent knowledge service. SuiteHarness remains the sole agent runtime."""
+"""Independent knowledge service; agent runtimes remain external consumers."""
 
 __version__ = "0.1.0"
-

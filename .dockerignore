@@ -1,4 +1,7 @@
 .git
+build
+dist
+**/*.egg-info
 .venv
 .test-data
 .build*

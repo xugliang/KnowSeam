@@ -4,12 +4,12 @@
   "k": 10,
   "cases": [
     {
-      "query": "Kino 的开票入口在哪里？",
+      "query": "示例产品的开票入口在哪里？",
       "expected_document_ids": ["REPLACE_WITH_ACTUAL_INVOICE_DOCUMENT_ID"],
       "collection_ids": ["REPLACE_WITH_AUTHORIZED_COLLECTION_ID"]
     },
     {
-      "query": "智标宝的账号权限规则和项目协作规则分别是什么？",
+      "query": "示例产品的账号权限规则和项目协作规则分别是什么？",
       "expected_document_ids": ["REPLACE_WITH_ACTUAL_ACCOUNT_DOCUMENT_ID", "REPLACE_WITH_ACTUAL_PROJECT_DOCUMENT_ID"],
       "collection_ids": ["REPLACE_WITH_AUTHORIZED_COLLECTION_ID"]
     },
