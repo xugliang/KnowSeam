@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Sequence
+from typing import Type
+
+from docling_core.types.doc import DocItemLabel
+
+from docling.datamodel.base_models import LayoutPrediction, Page
+from docling.datamodel.document import ConversionResult
+from docling.datamodel.pipeline_options import BaseLayoutOptions
+from docling.models.base_model import BaseModelWithOptions, BasePageModel
+
+# Cluster-label groupings shared by layout models and page assembly.
+TEXT_ELEM_LABELS = [
+    DocItemLabel.TEXT,
+    DocItemLabel.FOOTNOTE,
+    DocItemLabel.CAPTION,
+    DocItemLabel.CHECKBOX_UNSELECTED,
+    DocItemLabel.CHECKBOX_SELECTED,
+    DocItemLabel.SECTION_HEADER,
+    DocItemLabel.PAGE_HEADER,
+    DocItemLabel.PAGE_FOOTER,
+    DocItemLabel.CODE,
+    DocItemLabel.LIST_ITEM,
+    DocItemLabel.FORMULA,
+]
+PAGE_HEADER_LABELS = [DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER]
+TABLE_LABELS = [DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX]
+FIGURE_LABEL = DocItemLabel.PICTURE
+FORMULA_LABEL = DocItemLabel.FORMULA
+CONTAINER_LABELS = [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]
+
+
+class BaseLayoutModel(BasePageModel, BaseModelWithOptions, ABC):
+    """Shared interface for layout models."""
+
+    requires_layout_postprocessing: bool = True
+
+    @classmethod
+    @abstractmethod
+    def get_options_type(cls) -> Type[BaseLayoutOptions]:
+        """Return the options type supported by this layout model."""
+
+    @abstractmethod
+    def predict_layout(
+        self,
+        conv_res: ConversionResult,
+        pages: Sequence[Page],
+    ) -> Sequence[LayoutPrediction]:
+        """Produce layout predictions for the provided pages."""
+
+    def __call__(
+        self,
+        conv_res: ConversionResult,
+        page_batch: Iterable[Page],
+    ) -> Iterable[Page]:
+        pages = list(page_batch)
+        predictions = self.predict_layout(conv_res, pages)
+
+        for page, prediction in zip(pages, predictions):
+            page.predictions.layout = prediction
+            yield page

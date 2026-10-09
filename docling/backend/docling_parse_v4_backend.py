@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import warnings
+from io import BytesIO
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional, Union
+
+from docling.backend.docling_parse_backend import ThreadedDoclingParseDocumentBackend
+from docling.datamodel.backend_options import PdfBackendOptions
+
+if TYPE_CHECKING:
+    from docling.datamodel.document import InputDocument
+
+
+class DoclingParseV4DocumentBackend(ThreadedDoclingParseDocumentBackend):
+    def __init__(
+        self,
+        in_doc: "InputDocument",
+        path_or_stream: Union[BytesIO, Path],
+        options: Optional[PdfBackendOptions] = None,
+    ):
+        if options is None:
+            options = PdfBackendOptions()
+        warnings.warn(
+            "DoclingParseV4DocumentBackend is deprecated; use "
+            "ThreadedDoclingParseDocumentBackend instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(in_doc, path_or_stream, options)

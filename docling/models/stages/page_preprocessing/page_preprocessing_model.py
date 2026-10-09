@@ -1,0 +1,204 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import re
+import warnings
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Literal, Optional
+
+import numpy as np
+from docling_core.types.doc import BoundingBox
+from docling_core.types.doc.page import TextCell
+from PIL import ImageDraw
+from PIL.Image import Image
+from pydantic import BaseModel
+
+from docling.datamodel.base_models import Page
+from docling.datamodel.document import ConversionResult
+from docling.datamodel.pipeline_options import OcrMode, PdfPipelineOptions
+from docling.datamodel.settings import settings
+from docling.models.base_model import BasePageModel
+from docling.utils.profiling import TimeRecorder
+
+
+def resolve_skip_cell_extraction(pipeline_options: PdfPipelineOptions) -> bool:
+    """Whether the native segmented-page (text-cell) decode can be skipped.
+
+    In full-page OCR mode the native PDF text cells are discarded wholesale
+    during OCR post-processing, so extracting them is pure waste — and on
+    vector-dense pages (CAD/wiring schematics drawn as 100k+ path segments)
+    that decode costs multiple GiB regardless of cell content levels.
+    See https://github.com/docling-project/docling/issues/4058.
+    """
+    return bool(pipeline_options.do_ocr) and (
+        pipeline_options.ocr_options.mode == OcrMode.FULL_PAGE
+    )
+
+
+class PagePreprocessingOptions(BaseModel):
+    images_scale: Optional[float]
+    skip_cell_extraction: bool = (
+        False  # Skip text cell extraction for VLM-only processing
+    )
+    capture_reading_order_separators: bool = False
+
+
+class PagePreprocessingModel(BasePageModel):
+    def __init__(self, options: PagePreprocessingOptions):
+        self.options = options
+
+        # Pre-compiled regex patterns for efficiency
+        self.GLYPH_RE = re.compile(r"GLYPH<[0-9A-Fa-f]+>")
+        self.SLASH_G_RE = re.compile(r"(?:/G\d+){2,}")
+        self.FRAG_RE = re.compile(r"\b[A-Za-z](?:/[a-z]{1,3}\.[a-z]{1,3}){2,}\b")
+        self.SLASH_NUMBER_GARBAGE_RE = re.compile(
+            r"(?:/\w+\s*){2,}"
+        )  # Two or more "/token " sequences
+
+    def __call__(
+        self, conv_res: ConversionResult, page_batch: Iterable[Page]
+    ) -> Iterable[Page]:
+        for page in page_batch:
+            assert page._backend is not None
+            if not page._backend.is_valid():
+                yield page
+            else:
+                with TimeRecorder(conv_res, "page_parse"):
+                    page = self._populate_page_images(page)
+                    if self.options.capture_reading_order_separators:
+                        page = self._capture_shape_geometry(page)
+                    if not self.options.skip_cell_extraction:
+                        page = self._parse_page_cells(conv_res, page)
+                yield page
+
+    # Generate the page image and store it in the page object
+    def _populate_page_images(self, page: Page) -> Page:
+        # default scale
+        page.get_image(
+            scale=1.0
+        )  # puts the page image on the image cache at default scale
+
+        images_scale = self.options.images_scale
+        # user requested scales
+        if images_scale is not None:
+            page._default_image_scale = images_scale
+            page.get_image(
+                scale=images_scale
+            )  # this will trigger storing the image in the internal cache
+
+        return page
+
+    def _capture_shape_geometry(self, page: Page) -> Page:
+        """Retain visible vector geometry needed after the backend is released."""
+        assert page._backend is not None
+
+        page._shape_lines = page._backend.get_shape_lines()
+        page._shape_bounding_boxes = page._backend.get_connected_shape_bounding_boxes()
+        return page
+
+    # Extract and populate the page cells and store it in the page object
+    def _parse_page_cells(self, conv_res: ConversionResult, page: Page) -> Page:
+        assert page._backend is not None
+
+        page.parsed_page = page._backend.get_segmented_page()
+        assert page.parsed_page is not None
+
+        # Rate the text quality from the PDF parser, and aggregate on page
+        text_scores = []
+        for c in page.cells:
+            score = self.rate_text_quality(c.text)
+            text_scores.append(score)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", "Mean of empty slice", RuntimeWarning, "numpy"
+            )
+            conv_res.confidence.pages[page.page_no].parse_score = float(
+                np.nanquantile(
+                    text_scores, q=0.10
+                )  # To emphasise problems in the parse_score, we take the 10% percentile score of all text cells.
+            )
+
+        def draw_cell_boxes(
+            image: Image,
+            text_cells: Iterable[TextCell],
+            shape_cells: Iterable[BoundingBox],
+            bitmap_cells: Iterable[BoundingBox],
+            show: bool = False,
+        ) -> None:
+            r"""Draw the PDF cells: text in red, shapes in blue, bitmaps in green"""
+
+            image = image.copy()
+            draw = ImageDraw.Draw(image)
+            # Text cells in red
+            for c in text_cells:
+                bbox = c.to_bounding_box()
+                x0, y0, x1, y1 = (bbox.l, bbox.t, bbox.r, bbox.b)
+
+                draw.rectangle([(x0, y0), (x1, y1)], outline="red")
+            # Connected shape regions in blue
+            for bbox in shape_cells:
+                x0, y0, x1, y1 = (bbox.l, bbox.t, bbox.r, bbox.b)
+
+                draw.rectangle([(x0, y0), (x1, y1)], outline="blue")
+            # Bitmap rects in green
+            for bbox in bitmap_cells:
+                x0, y0, x1, y1 = (bbox.l, bbox.t, bbox.r, bbox.b)
+
+                draw.rectangle([(x0, y0), (x1, y1)], outline="green")
+            if show:
+                image.show()
+            else:
+                out_path: Path = (
+                    Path(settings.debug.debug_output_path)
+                    / f"debug_{conv_res.input.file.stem}"
+                )
+                out_path.mkdir(parents=True, exist_ok=True)
+
+                out_file = out_path / f"cells_page_{page.page_no:05}.png"
+                image.save(str(out_file), format="png")
+
+        if settings.debug.visualize_cells:
+            page_image = page.get_image(scale=1.0)
+            if page_image is not None:
+                # Not all backends support the shape boxes
+                shape_boxes = page._backend.get_connected_shape_bounding_boxes()
+                if shape_boxes is None:
+                    shape_boxes = []
+
+                draw_cell_boxes(
+                    page_image,
+                    page.cells,
+                    shape_boxes,
+                    page._backend.get_bitmap_rects(),
+                )
+
+        return page
+
+    def rate_text_quality(self, text: str) -> float:
+        # Hard errors: if any of these patterns are found, return 0.0 immediately.
+        blacklist_chars = ["�"]
+        if (
+            any(text.find(c) >= 0 for c in blacklist_chars)
+            or self.GLYPH_RE.search(text)
+            or self.SLASH_G_RE.search(text)
+            or self.SLASH_NUMBER_GARBAGE_RE.match(
+                text
+            )  # Check if text is mostly slash-number pattern
+        ):
+            return 0.0
+
+        penalty = 0.0
+
+        # Apply a penalty only if the fragmented words pattern occurs at least three times.
+        frag_matches = self.FRAG_RE.findall(text)
+        if len(frag_matches) >= 3:
+            penalty += 0.1 * len(frag_matches)
+
+        # Additional heuristic: if the average token length is below 2, add a penalty.
+        # tokens = text.split()
+        # if tokens and (sum(map(len, tokens)) / len(tokens)) < 2:
+        #    penalty += 0.2
+
+        return max(1.0 - penalty, 0.0)

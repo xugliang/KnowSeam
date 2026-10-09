@@ -1,0 +1,207 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import csv
+import logging
+import warnings
+from collections.abc import Callable
+from io import BytesIO, StringIO
+from pathlib import Path
+from typing import Final, Optional, Set, Union
+
+from docling_core.types.doc import DoclingDocument, DocumentOrigin, TableCell, TableData
+
+from docling.backend.abstract_backend import DeclarativeDocumentBackend
+from docling.datamodel.backend_options import CsvBackendOptions
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.document import InputDocument
+from docling.exceptions import DocumentLoadError
+from docling.utils.text_decoding import decode_text
+
+_log = logging.getLogger(__name__)
+
+# Characters of the file handed to csv.Sniffer when the first line alone
+# cannot be sniffed.
+_SNIFF_SAMPLE_SIZE: Final[int] = 4096
+_DELIMITERS: Final[str] = ",;\t|:"
+
+
+def _sniff_dialect(head: str, read_sample: Callable[[], str]) -> type[csv.Dialect]:
+    """Detect the dialect from the first line, falling back to a larger sample.
+
+    The first line is enough for most files and is what the sniffer reads best:
+    it rejects samples whose rows hold different numbers of delimiters. A
+    successful sniff must also parse as a complete record: a line cut inside a
+    quoted field can otherwise mistake its content for a delimiter. Retrying
+    with a sample that closes the quote recovers those.
+    `read_sample` is only called on that fallback path.
+
+    Raises csv.Error if neither can be detected.
+    """
+    try:
+        dialect = csv.Sniffer().sniff(head, _DELIMITERS)
+        # Sniffer can succeed on a delimiter inside an unfinished quoted field.
+        # Only trust the first-line dialect if it also parses a complete record.
+        next(csv.reader([head], dialect=dialect, doublequote=True, strict=True))
+        return dialect
+    except csv.Error:
+        return csv.Sniffer().sniff(read_sample(), _DELIMITERS)
+
+
+class CsvDocumentBackend(DeclarativeDocumentBackend):
+    content: StringIO
+
+    def __init__(
+        self,
+        in_doc: "InputDocument",
+        path_or_stream: Union[BytesIO, Path],
+        options: Optional[CsvBackendOptions] = None,
+    ):
+        if options is None:
+            options = CsvBackendOptions()
+        super().__init__(in_doc, path_or_stream, options)
+
+        # A leading BOM is dropped, which matters here because Excel and Google
+        # Sheets both write one when exporting "CSV UTF-8"; left in, it becomes
+        # part of the first header cell.
+        try:
+            self.content = StringIO(decode_text(path_or_stream, options.encoding))
+            self.valid = True
+        except DocumentLoadError:
+            # Already carries a message naming what could not be decoded.
+            raise
+        except Exception as e:
+            raise DocumentLoadError(
+                f"CsvDocumentBackend could not load document with hash {self.document_hash}"
+            ) from e
+        return
+
+    def is_valid(self) -> bool:
+        return self.valid
+
+    @classmethod
+    def supports_pagination(cls) -> bool:
+        return False
+
+    def unload(self):
+        if isinstance(self.path_or_stream, BytesIO):
+            self.path_or_stream.close()
+        self.path_or_stream = None
+
+    @classmethod
+    def supported_formats(cls) -> Set[InputFormat]:
+        return {InputFormat.CSV}
+
+    def convert(self) -> DoclingDocument:
+        """Parse the CSV content into a DoclingDocument.
+
+        Dialect detection sniffs and validates the first line; a larger sample
+        is only read when that fails (e.g. a quoted field spanning multiple
+        lines cuts the first line mid-quote). If sniffing fails entirely, `csv.excel`
+        (comma delimiter) is used as the fallback.
+
+        `doublequote=True` is passed explicitly because `csv.Sniffer` only
+        sets it when it actually sees `""` in the sample, and the sample is
+        usually the header line, which rarely contains one. RFC 4180 and
+        `csv.excel` both use doubling, so it is the correct default.
+        """
+        # Dialect detection: the larger sample is only read on fallback.
+        head = self.content.readline()
+        while head in ("\n", "\r\n", "\r"):
+            head = self.content.readline()
+        sample_start = self.content.tell() - len(head)
+
+        def read_sample() -> str:
+            self.content.seek(sample_start)
+            return self.content.read(_SNIFF_SAMPLE_SIZE)
+
+        try:
+            dialect: type[csv.Dialect] = _sniff_dialect(head, read_sample)
+            if dialect.delimiter not in _DELIMITERS:
+                raise RuntimeError(
+                    f"Cannot convert csv with unknown delimiter {dialect.delimiter}."
+                )
+            else:
+                _log.info(f'Parsing CSV with delimiter: "{dialect.delimiter}"')
+        except csv.Error as e:
+            # Fall back to comma (e.g. single-column or insufficient data to detect).
+            _log.info(
+                f"Could not detect delimiter ({e}), using default comma delimiter"
+            )
+            dialect = csv.excel
+
+        self.content.seek(0)
+        try:
+            result = csv.reader(
+                self.content,
+                dialect=dialect,
+                doublequote=True,
+                strict=True,
+            )
+            self.csv_data = list(result)
+        except csv.Error as e:
+            raise DocumentLoadError(
+                f"CsvDocumentBackend could not parse document with hash {self.document_hash}."
+            ) from e
+
+        # csv.reader yields [] for blank lines; ["", ...] for empty-field rows like ",,".
+        # Filtering on truthiness keeps the latter and drops the former.
+        self.csv_data = [row for row in self.csv_data if row]
+
+        _log.info(f"Detected {len(self.csv_data)} lines")
+
+        # Parse the CSV into a structured document model
+        origin = DocumentOrigin(
+            filename=self.file.name or "file.csv",
+            mimetype="text/csv",
+            binary_hash=self.document_hash,
+        )
+
+        doc = DoclingDocument(name=self.file.stem or "file.csv", origin=origin)
+
+        if self.is_valid():
+            # Convert CSV data to table
+            if not self.csv_data:
+                _log.warning("CSV file is empty, returning empty document.")
+            else:
+                expected_length = len(self.csv_data[0])
+                is_uniform = all(len(row) == expected_length for row in self.csv_data)
+                if not is_uniform:
+                    warnings.warn(
+                        f"Inconsistent column lengths detected in CSV data. "
+                        f"Expected {expected_length} columns, but found rows with varying lengths. "
+                        f"Ensure all rows have the same number of columns."
+                    )
+
+                num_rows = len(self.csv_data)
+                num_cols = max(len(row) for row in self.csv_data)
+
+                table_data = TableData(
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                    table_cells=[],
+                )
+
+                # Convert each cell to TableCell
+                for row_idx, row in enumerate(self.csv_data):
+                    for col_idx, cell_value in enumerate(row):
+                        cell = TableCell(
+                            text=str(cell_value),
+                            row_span=1,  # CSV doesn't support merged cells
+                            col_span=1,
+                            start_row_offset_idx=row_idx,
+                            end_row_offset_idx=row_idx + 1,
+                            start_col_offset_idx=col_idx,
+                            end_col_offset_idx=col_idx + 1,
+                            column_header=row_idx == 0,  # First row as header
+                            row_header=False,
+                        )
+                        table_data.table_cells.append(cell)
+
+                doc.add_table(data=table_data)
+        else:
+            raise RuntimeError(
+                f"Cannot convert doc with {self.document_hash} because the backend failed to init."
+            )
+
+        return doc

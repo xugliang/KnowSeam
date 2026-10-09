@@ -1,0 +1,817 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+"""Tests for VLM preset system and runtime options management.
+
+This test suite validates:
+1. Preset registration and retrieval
+2. Runtime options creation and validation
+3. Preset-based options creation with runtime overrides
+4. Model spec runtime-specific configurations
+5. All three stage types (VlmConvert, PictureDescription, CodeFormula)
+"""
+
+import pytest
+from pydantic import ValidationError
+
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+from docling.datamodel.pipeline_options import (
+    CodeFormulaVlmOptions,
+    PictureDescriptionVlmEngineOptions,
+    VlmConvertOptions,
+)
+from docling.datamodel.pipeline_options_vlm_model import (
+    ResponseFormat,
+    TransformersModelType,
+)
+from docling.datamodel.stage_model_specs import (
+    ApiModelConfig,
+    EngineModelConfig,
+    StageModelPreset,
+    VlmModelSpec,
+)
+from docling.datamodel.vlm_engine_options import (
+    ApiVlmEngineOptions,
+    AutoInlineVlmEngineOptions,
+    MlxVlmEngineOptions,
+    TransformersVlmEngineOptions,
+    VllmVlmEngineOptions,
+)
+from docling.models.inference_engines.vlm import VlmEngineType
+from docling.models.inference_engines.vlm.transformers_engine import (
+    TransformersVlmEngine,
+)
+
+pytestmark = pytest.mark.ml_vlm
+
+# =============================================================================
+# RUNTIME OPTIONS TESTS
+# =============================================================================
+
+
+class TestRuntimeOptions:
+    """Test runtime options creation and validation."""
+
+    def test_auto_inline_engine_options(self):
+        """Test AutoInlineVlmEngineOptions creation."""
+        options = AutoInlineVlmEngineOptions()
+        assert options.engine_type == VlmEngineType.AUTO_INLINE
+        assert options.prefer_vllm is False
+
+        options_with_vllm = AutoInlineVlmEngineOptions(prefer_vllm=True)
+        assert options_with_vllm.prefer_vllm is True
+
+    def test_transformers_engine_options(self):
+        """Test TransformersVlmEngineOptions creation and defaults."""
+        options = TransformersVlmEngineOptions()
+        assert options.engine_type == VlmEngineType.TRANSFORMERS
+        assert options.load_in_8bit is True
+        assert options.llm_int8_threshold == 6.0
+        assert options.quantized is False
+        assert options.trust_remote_code is False
+        assert options.use_kv_cache is True
+
+        # Test custom values
+        custom_options = TransformersVlmEngineOptions(
+            load_in_8bit=False,
+            trust_remote_code=True,
+            torch_dtype="float16",
+            compile_model=True,
+        )
+        assert custom_options.load_in_8bit is False
+        assert custom_options.trust_remote_code is True
+        assert custom_options.torch_dtype == "float16"
+        assert custom_options.compile_model is True
+
+    def test_mlx_engine_options(self):
+        """Test MlxVlmEngineOptions creation."""
+        options = MlxVlmEngineOptions()
+        assert options.engine_type == VlmEngineType.MLX
+        assert options.trust_remote_code is False
+
+        options_with_trust = MlxVlmEngineOptions(trust_remote_code=True)
+        assert options_with_trust.trust_remote_code is True
+
+    def test_api_engine_options(self):
+        """Test ApiVlmEngineOptions for different API types."""
+        # Test Ollama
+        ollama_options = ApiVlmEngineOptions(engine_type=VlmEngineType.API_OLLAMA)
+        assert ollama_options.engine_type == VlmEngineType.API_OLLAMA
+        assert ollama_options.timeout == 60.0  # Default timeout
+        assert ollama_options.concurrency == 1
+
+        # Test OpenAI
+        openai_options = ApiVlmEngineOptions(
+            engine_type=VlmEngineType.API_OPENAI,
+            timeout=60.0,
+            concurrency=5,
+        )
+        assert openai_options.engine_type == VlmEngineType.API_OPENAI
+        assert openai_options.timeout == 60.0
+        assert openai_options.concurrency == 5
+
+        # Test LM Studio
+        lmstudio_options = ApiVlmEngineOptions(engine_type=VlmEngineType.API_LMSTUDIO)
+        assert lmstudio_options.engine_type == VlmEngineType.API_LMSTUDIO
+
+        # Test Generic API
+        generic_options = ApiVlmEngineOptions(engine_type=VlmEngineType.API)
+        assert generic_options.engine_type == VlmEngineType.API
+
+    def test_vllm_engine_options(self):
+        """Test VllmVlmEngineOptions creation."""
+        options = VllmVlmEngineOptions()
+        assert options.engine_type == VlmEngineType.VLLM
+        assert options.model_impl == "auto"
+
+        with pytest.raises(ValidationError):
+            VllmVlmEngineOptions(model_impl=None)
+
+    def test_transformers_engine_accepts_json_model_type(self, monkeypatch):
+        """Custom JSON configs carry enum values as strings."""
+        calls = []
+
+        def fake_load_model_for_repo(
+            self,
+            repo_id,
+            revision="main",
+            model_type=TransformersModelType.AUTOMODEL,
+        ):
+            calls.append((repo_id, revision, model_type))
+
+        monkeypatch.setattr(
+            TransformersVlmEngine, "_load_model_for_repo", fake_load_model_for_repo
+        )
+
+        TransformersVlmEngine(
+            options=TransformersVlmEngineOptions(),
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            artifacts_path=None,
+            model_config=EngineModelConfig(
+                repo_id="test/model",
+                revision="v1",
+                extra_config={
+                    "transformers_model_type": (
+                        TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT.value
+                    )
+                },
+            ),
+        )
+
+        assert calls == [
+            (
+                "test/model",
+                "v1",
+                TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+            )
+        ]
+
+    def test_transformers_engine_rejects_dots_on_transformers_v5(self, monkeypatch):
+        """Dots models are a transformers-v4-only runtime path."""
+        import docling.models.inference_engines.vlm.transformers_engine as tf_engine
+
+        monkeypatch.setattr(
+            tf_engine.importlib.metadata,
+            "version",
+            lambda package: "5.0.0" if package == "transformers" else "0.0.0",
+        )
+
+        engine = TransformersVlmEngine(
+            options=TransformersVlmEngineOptions(),
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            artifacts_path=None,
+        )
+
+        with pytest.raises(NotImplementedError, match="transformers<5"):
+            engine._load_model_for_repo("rednote-hilab/dots.ocr")
+
+    @pytest.mark.parametrize(
+        ("transformers_version", "expected_dtype_arg"),
+        [("4.51.3", "torch_dtype"), ("5.0.0", "dtype")],
+    )
+    def test_transformers_engine_uses_versioned_dtype_arg(
+        self, monkeypatch, transformers_version, expected_dtype_arg
+    ):
+        """Transformers 4 remote models still expect torch_dtype."""
+        import docling.models.inference_engines.vlm.transformers_engine as tf_engine
+
+        captured_kwargs = {}
+
+        class FakeProcessor:
+            tokenizer = None
+
+        class FakeModel:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+                return cls()
+
+            def eval(self):
+                return None
+
+        monkeypatch.setattr(
+            tf_engine.importlib.metadata,
+            "version",
+            lambda package: (
+                transformers_version if package == "transformers" else "0.0.0"
+            ),
+        )
+        monkeypatch.setattr(
+            tf_engine,
+            "resolve_model_artifacts_path",
+            lambda **kwargs: "artifacts",
+        )
+        monkeypatch.setattr(
+            tf_engine.AutoProcessor,
+            "from_pretrained",
+            lambda *args, **kwargs: FakeProcessor(),
+        )
+        monkeypatch.setattr(tf_engine, "AutoModelForCausalLM", FakeModel)
+        monkeypatch.setattr(
+            tf_engine.GenerationConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: object(),
+        )
+
+        engine = TransformersVlmEngine(
+            options=TransformersVlmEngineOptions(
+                torch_dtype="bfloat16",
+                compile_model=False,
+            ),
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            artifacts_path=None,
+        )
+        engine.device = "cpu"
+
+        engine._load_model_for_repo(
+            "rednote-hilab/dots.ocr"
+            if transformers_version.startswith("4.")
+            else "test/model",
+            model_type=TransformersModelType.AUTOMODEL_CAUSALLM,
+        )
+
+        assert captured_kwargs[expected_dtype_arg] == "bfloat16"
+        assert ("dtype" in captured_kwargs) is (expected_dtype_arg == "dtype")
+        assert ("torch_dtype" in captured_kwargs) is (
+            expected_dtype_arg == "torch_dtype"
+        )
+
+    @pytest.mark.parametrize(
+        ("transformers_version", "expected_trust_remote_code"),
+        [("5.7.0", True), ("5.8.0", False), ("5.16.1", False)],
+    )
+    def test_transformers_engine_loads_granite_vision_4_natively(
+        self, monkeypatch, transformers_version, expected_trust_remote_code
+    ):
+        """Granite Vision 4 skips its bundled code where transformers ships it."""
+        import docling.models.inference_engines.vlm.transformers_engine as tf_engine
+
+        processor_kwargs = {}
+        model_kwargs = {}
+
+        class FakeProcessor:
+            tokenizer = None
+
+        class FakeModel:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                model_kwargs.update(kwargs)
+                return cls()
+
+            def eval(self):
+                return None
+
+        def fake_processor_from_pretrained(*args, **kwargs):
+            processor_kwargs.update(kwargs)
+            return FakeProcessor()
+
+        monkeypatch.setattr(
+            tf_engine.importlib.metadata,
+            "version",
+            lambda package: (
+                transformers_version if package == "transformers" else "0.0.0"
+            ),
+        )
+        monkeypatch.setattr(
+            tf_engine,
+            "resolve_model_artifacts_path",
+            lambda **kwargs: "artifacts",
+        )
+        monkeypatch.setattr(
+            tf_engine.AutoProcessor, "from_pretrained", fake_processor_from_pretrained
+        )
+        monkeypatch.setattr(tf_engine, "AutoModelForImageTextToText", FakeModel)
+        monkeypatch.setattr(
+            tf_engine.GenerationConfig,
+            "from_pretrained",
+            lambda *args, **kwargs: object(),
+        )
+
+        engine = TransformersVlmEngine(
+            options=TransformersVlmEngineOptions(
+                trust_remote_code=True,
+                compile_model=False,
+            ),
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            artifacts_path=None,
+        )
+        engine.device = "cpu"
+
+        engine._load_model_for_repo(
+            "ibm-granite/granite-vision-4.1-4b",
+            model_type=TransformersModelType.AUTOMODEL_IMAGETEXTTOTEXT,
+        )
+
+        assert processor_kwargs["trust_remote_code"] is expected_trust_remote_code
+        assert model_kwargs["trust_remote_code"] is expected_trust_remote_code
+        assert model_kwargs["_attn_implementation"] is None
+
+    def test_dots_mocr_requires_flash_attn(self, monkeypatch):
+        """dots.mocr remote code imports flash_attn even when SDPA is selected."""
+        import docling.models.inference_engines.vlm.transformers_engine as tf_engine
+
+        original_import_module = tf_engine.importlib.import_module
+
+        def import_module(name, *args, **kwargs):
+            if name == "flash_attn":
+                raise ImportError
+            return original_import_module(name, *args, **kwargs)
+
+        monkeypatch.setattr(tf_engine.importlib, "import_module", import_module)
+
+        with pytest.raises(ImportError, match="requires flash-attn"):
+            tf_engine._ensure_dots_flash_attn_import()
+
+
+# =============================================================================
+# MODEL SPEC TESTS
+# =============================================================================
+
+
+class TestVlmModelSpec:
+    """Test VlmModelSpec functionality."""
+
+    def test_basic_model_spec(self):
+        """Test basic model spec creation."""
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+        )
+        assert spec.name == "Test Model"
+        assert spec.default_repo_id == "test/model"
+        assert spec.revision == "main"
+        assert spec.prompt == "Test prompt"
+        assert spec.response_format == ResponseFormat.DOCTAGS
+
+    def test_model_spec_with_engine_overrides(self):
+        """Test model spec with engine-specific overrides."""
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+            engine_overrides={
+                VlmEngineType.MLX: EngineModelConfig(
+                    repo_id="test/model-mlx", revision="v1.0"
+                ),
+                VlmEngineType.TRANSFORMERS: EngineModelConfig(revision="v2.0"),
+            },
+        )
+
+        # Test default repo_id
+        assert spec.get_repo_id(VlmEngineType.AUTO_INLINE) == "test/model"
+
+        # Test MLX override
+        assert spec.get_repo_id(VlmEngineType.MLX) == "test/model-mlx"
+        assert spec.get_revision(VlmEngineType.MLX) == "v1.0"
+
+        # Test Transformers override (only revision)
+        assert spec.get_repo_id(VlmEngineType.TRANSFORMERS) == "test/model"
+        assert spec.get_revision(VlmEngineType.TRANSFORMERS) == "v2.0"
+
+    def test_get_engine_config_preserves_torch_dtype_in_extra_config(self):
+        """Test that get_engine_config() preserves torch_dtype in extra_config.
+
+        Regression test for #3026: torch_dtype needs to be passed via
+        extra_config so it flows through to the engine.
+        """
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+            engine_overrides={
+                VlmEngineType.TRANSFORMERS: EngineModelConfig(
+                    extra_config={
+                        "some_key": "some_value",
+                        "torch_dtype": "bfloat16",
+                    },
+                ),
+            },
+        )
+
+        config = spec.get_engine_config(VlmEngineType.TRANSFORMERS)
+        assert config.extra_config["torch_dtype"] == "bfloat16"
+        assert config.extra_config["some_key"] == "some_value"
+
+        # Engine without override should not have torch_dtype in extra_config
+        config_other = spec.get_engine_config(VlmEngineType.MLX)
+        assert "torch_dtype" not in config_other.extra_config
+
+    def test_get_engine_config_preserves_transformers_stop_string_cleanup_flag(self):
+        """Transformers-only decoded stop-string stripping stays in extra_config."""
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+            engine_overrides={
+                VlmEngineType.TRANSFORMERS: EngineModelConfig(
+                    extra_config={"transformers_strip_stop_strings": True},
+                ),
+            },
+        )
+
+        assert (
+            spec.get_engine_config(VlmEngineType.TRANSFORMERS).extra_config[
+                "transformers_strip_stop_strings"
+            ]
+            is True
+        )
+        assert (
+            "transformers_strip_stop_strings"
+            not in spec.get_engine_config(VlmEngineType.VLLM).extra_config
+        )
+
+    def test_same_repo_engine_override_counts_as_explicit_support(self):
+        """Native handlers can use the default repo_id and still be explicit."""
+        spec = VlmModelSpec(
+            name="Falcon-Style Model",
+            default_repo_id="org/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.MARKDOWN,
+            engine_overrides={VlmEngineType.MLX: EngineModelConfig()},
+        )
+
+        assert spec.has_explicit_engine_export(VlmEngineType.MLX) is True
+
+    def test_model_spec_with_api_overrides(self):
+        """Test model spec with API-specific overrides."""
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.MARKDOWN,
+            api_overrides={
+                VlmEngineType.API_OLLAMA: ApiModelConfig(
+                    params={"model": "test-model:latest", "max_tokens": 4096}
+                ),
+            },
+        )
+
+        # Test default API params
+        default_params = spec.get_api_params(VlmEngineType.API_OPENAI)
+        assert default_params == {"model": "test/model"}
+
+        # Test Ollama override
+        ollama_params = spec.get_api_params(VlmEngineType.API_OLLAMA)
+        assert ollama_params["model"] == "test-model:latest"
+        assert ollama_params["max_tokens"] == 4096
+
+    def test_model_spec_supported_engines(self):
+        """Test model spec with supported engines restriction."""
+        spec = VlmModelSpec(
+            name="API-Only Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.MARKDOWN,
+            supported_engines={VlmEngineType.API_OLLAMA, VlmEngineType.API_OPENAI},
+        )
+
+        assert spec.is_engine_supported(VlmEngineType.API_OLLAMA) is True
+        assert spec.is_engine_supported(VlmEngineType.API_OPENAI) is True
+        assert spec.is_engine_supported(VlmEngineType.TRANSFORMERS) is False
+        assert spec.is_engine_supported(VlmEngineType.MLX) is False
+
+        # Test spec with no restrictions
+        unrestricted_spec = VlmModelSpec(
+            name="Universal Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+        )
+        assert unrestricted_spec.is_engine_supported(VlmEngineType.TRANSFORMERS) is True
+        assert unrestricted_spec.is_engine_supported(VlmEngineType.MLX) is True
+
+
+# =============================================================================
+# PRESET SYSTEM TESTS
+# =============================================================================
+
+
+class TestPresetSystem:
+    """Test preset registration and retrieval."""
+
+    def test_preset_not_found_error(self):
+        """Test that requesting non-existent preset raises KeyError."""
+        with pytest.raises(KeyError) as exc_info:
+            VlmConvertOptions.get_preset("nonexistent_preset")
+
+        assert "nonexistent_preset" in str(exc_info.value)
+        assert "Available presets:" in str(exc_info.value)
+
+    def test_list_presets(self):
+        """Test listing all presets for a stage."""
+        vlm_convert_presets = VlmConvertOptions.list_presets()
+        assert len(vlm_convert_presets) >= 6  # At least 6 VlmConvert presets
+        assert all(isinstance(p, StageModelPreset) for p in vlm_convert_presets)
+
+        picture_desc_presets = PictureDescriptionVlmEngineOptions.list_presets()
+        assert len(picture_desc_presets) >= 4  # At least 4 PictureDescription presets
+
+        code_formula_presets = CodeFormulaVlmOptions.list_presets()
+        assert len(code_formula_presets) >= 1  # At least 1 CodeFormula preset
+
+    def test_get_preset_info(self):
+        """Test getting preset summary information."""
+        info = VlmConvertOptions.get_preset_info()
+        assert len(info) >= 6
+
+        # Check structure of info
+        for preset_info in info:
+            assert "preset_id" in preset_info
+            assert "name" in preset_info
+            assert "description" in preset_info
+            assert "model" in preset_info
+            assert "default_engine" in preset_info
+
+
+# =============================================================================
+# PRESET-BASED OPTIONS CREATION TESTS
+# =============================================================================
+
+
+class TestPresetBasedOptionsCreation:
+    """Test creating options from presets."""
+
+    def test_create_vlm_convert_from_preset_default_runtime(self):
+        """Test creating VlmConvertOptions from preset with default runtime."""
+        options = VlmConvertOptions.from_preset("smoldocling")
+
+        assert options.model_spec is not None
+        assert options.model_spec.name == "SmolDocling-256M"
+        assert options.model_spec.response_format == ResponseFormat.DOCTAGS
+        assert options.engine_options is not None
+        assert options.engine_options.engine_type == VlmEngineType.AUTO_INLINE
+        assert options.scale == 2.0
+
+    def test_create_vlm_convert_from_preset_with_engine_override(self):
+        """Test creating VlmConvertOptions with engine override."""
+        # Override with Transformers engine
+        transformers_engine = TransformersVlmEngineOptions(load_in_8bit=False)
+        options = VlmConvertOptions.from_preset(
+            "smoldocling", engine_options=transformers_engine
+        )
+
+        assert options.engine_options.engine_type == VlmEngineType.TRANSFORMERS
+        assert isinstance(options.engine_options, TransformersVlmEngineOptions)
+        assert options.engine_options.load_in_8bit is False
+        assert options.model_spec.name == "SmolDocling-256M"
+
+        # Override with MLX engine
+        mlx_engine = MlxVlmEngineOptions()
+        options_mlx = VlmConvertOptions.from_preset(
+            "granite_docling", engine_options=mlx_engine
+        )
+
+        assert options_mlx.engine_options.engine_type == VlmEngineType.MLX
+        assert options_mlx.model_spec.name == "Granite-Docling-258M"
+
+        # Override with API engine
+        api_engine = ApiVlmEngineOptions(
+            engine_type=VlmEngineType.API_OLLAMA, timeout=60.0
+        )
+        options_api = VlmConvertOptions.from_preset(
+            "deepseek_ocr", engine_options=api_engine
+        )
+
+        assert options_api.engine_options.engine_type == VlmEngineType.API_OLLAMA
+        assert isinstance(options_api.engine_options, ApiVlmEngineOptions)
+        assert options_api.engine_options.timeout == 60.0
+
+    def test_create_picture_description_from_preset(self):
+        """Test creating PictureDescriptionVlmOptions from preset."""
+        # PictureDescriptionVlmOptions has legacy fields that need to be provided
+        # Skip this test as it requires backward compatibility handling
+        # The preset system works for VlmConvert and CodeFormula which don't have legacy fields
+        pytest.skip(
+            "PictureDescriptionVlmOptions requires legacy repo_id field - backward compatibility issue"
+        )
+
+    def test_create_code_formula_from_preset(self):
+        """Test creating CodeFormulaVlmOptions from preset."""
+        options = CodeFormulaVlmOptions.from_preset("codeformulav2")
+
+        assert options.model_spec is not None
+        assert options.engine_options is not None
+        assert options.scale == 2.0
+
+    def test_preset_with_parameter_overrides(self):
+        """Test creating options from preset with additional parameter overrides."""
+        options = VlmConvertOptions.from_preset(
+            "smoldocling",
+            scale=3.0,
+            max_size=2048,
+        )
+
+        assert options.scale == 3.0
+        assert options.max_size == 2048
+        assert options.model_spec.name == "SmolDocling-256M"
+
+    def test_preset_mlx_engine_override_uses_mlx_repo(self):
+        """Test that MLX engine uses MLX-specific repo_id from model spec."""
+        preset = VlmConvertOptions.get_preset("smoldocling")
+
+        # Check that MLX override exists
+        assert VlmEngineType.MLX in preset.model_spec.engine_overrides
+
+        # Get repo_id for different engines
+        default_repo = preset.model_spec.get_repo_id(VlmEngineType.TRANSFORMERS)
+        mlx_repo = preset.model_spec.get_repo_id(VlmEngineType.MLX)
+
+        assert default_repo == "docling-project/SmolDocling-256M-preview"
+        assert mlx_repo == "docling-project/SmolDocling-256M-preview-mlx-bf16"
+        assert default_repo != mlx_repo
+
+    def test_preset_api_override_uses_api_params(self):
+        """Test that API engine uses API-specific params from model spec."""
+        preset = VlmConvertOptions.get_preset("granite_docling")
+
+        # Check that API override exists for Ollama
+        assert VlmEngineType.API_OLLAMA in preset.model_spec.api_overrides
+
+        # Get API params
+        default_params = preset.model_spec.get_api_params(VlmEngineType.API_OPENAI)
+        ollama_params = preset.model_spec.get_api_params(VlmEngineType.API_OLLAMA)
+
+        assert default_params["model"] == "ibm-granite/granite-docling-258M"
+        assert ollama_params["model"] == "ibm/granite-docling:258m"
+
+
+# =============================================================================
+# INTEGRATION TESTS
+# =============================================================================
+
+
+class TestPresetEngineIntegration:
+    """Test integration between presets and engine options."""
+
+    def test_all_vlm_convert_presets_can_be_instantiated(self):
+        """Test that all VlmConvert presets can be instantiated."""
+        preset_ids = VlmConvertOptions.list_preset_ids()
+
+        for preset_id in preset_ids:
+            options = VlmConvertOptions.from_preset(preset_id)
+            assert options.model_spec is not None
+            assert options.engine_options is not None
+            assert options.scale > 0
+
+    def test_all_picture_description_presets_can_be_instantiated(self):
+        """Test that all PictureDescription presets can be instantiated."""
+        # Now fully supported with the new runtime options class
+        preset_ids = PictureDescriptionVlmEngineOptions.list_preset_ids()
+
+        for preset_id in preset_ids:
+            options = PictureDescriptionVlmEngineOptions.from_preset(preset_id)
+            assert options.model_spec is not None
+            assert options.engine_options is not None
+
+    def test_all_code_formula_presets_can_be_instantiated(self):
+        """Test that all CodeFormula presets can be instantiated."""
+        preset_ids = CodeFormulaVlmOptions.list_preset_ids()
+
+        for preset_id in preset_ids:
+            options = CodeFormulaVlmOptions.from_preset(preset_id)
+            assert options.model_spec is not None
+            assert options.engine_options is not None
+
+    def test_preset_with_all_engine_types(self):
+        """Test that a preset can be used with all engine types."""
+        preset_id = "smoldocling"
+
+        # Test with each engine type
+        engine_options_list = [
+            AutoInlineVlmEngineOptions(),
+            TransformersVlmEngineOptions(),
+            MlxVlmEngineOptions(),
+            ApiVlmEngineOptions(engine_type=VlmEngineType.API_OLLAMA),
+            ApiVlmEngineOptions(engine_type=VlmEngineType.API_OPENAI),
+            VllmVlmEngineOptions(),
+        ]
+
+        for engine_options in engine_options_list:
+            options = VlmConvertOptions.from_preset(
+                preset_id, engine_options=engine_options
+            )
+            assert options.engine_options.engine_type == engine_options.engine_type
+
+    def test_deepseek_ocr_preset_api_only(self):
+        """Test that DeepSeek OCR preset is API-only."""
+        preset = VlmConvertOptions.get_preset("deepseek_ocr")
+
+        # Should only support API engines
+        assert preset.model_spec.supported_engines is not None
+        assert VlmEngineType.API_OLLAMA in preset.model_spec.supported_engines
+        assert VlmEngineType.TRANSFORMERS not in preset.model_spec.supported_engines
+        assert VlmEngineType.MLX not in preset.model_spec.supported_engines
+
+    def test_response_format_consistency(self):
+        """Test that response formats are valid across all presets."""
+        # All presets should have valid response formats
+        # Note: Presets may be shared across different stage types
+        all_valid_formats = [
+            ResponseFormat.DOCTAGS,
+            ResponseFormat.DOCLANG,
+            ResponseFormat.MARKDOWN,
+            ResponseFormat.DEEPSEEKOCR_MARKDOWN,
+            ResponseFormat.UNLIMITED_OCR_MARKDOWN,
+            ResponseFormat.PLAINTEXT,
+            ResponseFormat.CHANDRA_HTML,
+            ResponseFormat.DOTS_JSON,
+            ResponseFormat.NEMOTRON_PARSE_V2,
+            ResponseFormat.MINERU2,
+        ]
+
+        # Check VlmConvert presets
+        vlm_convert_presets = VlmConvertOptions.list_presets()
+        for preset in vlm_convert_presets:
+            assert preset.model_spec.response_format in all_valid_formats
+
+        # Check PictureDescription presets
+        picture_desc_presets = PictureDescriptionVlmEngineOptions.list_presets()
+        for preset in picture_desc_presets:
+            assert preset.model_spec.response_format in all_valid_formats
+
+        # Check CodeFormula presets
+        code_formula_presets = CodeFormulaVlmOptions.list_presets()
+        for preset in code_formula_presets:
+            assert preset.model_spec.response_format in all_valid_formats
+
+
+# =============================================================================
+# EDGE CASES AND ERROR HANDLING
+# =============================================================================
+
+
+class TestEdgeCases:
+    """Test edge cases and error handling."""
+
+    def test_preset_registration_idempotent(self):
+        """Test that registering the same preset twice doesn't cause issues."""
+        # Get current count
+        initial_count = len(VlmConvertOptions.list_preset_ids())
+
+        # Try to register an existing preset again
+        existing_preset = VlmConvertOptions.get_preset("smoldocling")
+        VlmConvertOptions.register_preset(existing_preset)
+
+        # Count should remain the same
+        final_count = len(VlmConvertOptions.list_preset_ids())
+        assert initial_count == final_count
+
+    def test_engine_options_validation(self):
+        """Test that engine options are validated properly."""
+        # Valid options should work
+        valid_options = TransformersVlmEngineOptions(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+        )
+        assert valid_options.load_in_8bit is True
+
+        # Invalid engine_type should fail
+        with pytest.raises(ValidationError):
+            ApiVlmEngineOptions(engine_type="invalid_engine")  # type: ignore
+
+    def test_model_spec_with_empty_overrides(self):
+        """Test model spec with empty override dictionaries."""
+        spec = VlmModelSpec(
+            name="Test Model",
+            default_repo_id="test/model",
+            prompt="Test prompt",
+            response_format=ResponseFormat.DOCTAGS,
+            engine_overrides={},
+            api_overrides={},
+        )
+
+        # Should use defaults
+        assert spec.get_repo_id(VlmEngineType.TRANSFORMERS) == "test/model"
+        assert spec.get_revision(VlmEngineType.MLX) == "main"
+        assert spec.get_api_params(VlmEngineType.API_OLLAMA) == {"model": "test/model"}
+
+    def test_preset_with_none_max_size(self):
+        """Test that presets can have None for max_size."""
+        options = VlmConvertOptions.from_preset("smoldocling")
+        # max_size can be None (no limit)
+        assert options.max_size is None or isinstance(options.max_size, int)
