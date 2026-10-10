@@ -65,3 +65,14 @@ python -m ruff check --config pyproject.toml src tests
 ## 发布边界
 
 本仓采用 [MIT](LICENSE)，允许商业使用和修改，须保留许可声明。仓库不包含公司文档、索引、凭据、权重或 A/B 业务代码。依赖库及模型权重遵循各自许可证，MIT 不重新授权第三方内容。
+
+## 可选的本地文档解析
+
+`third_party/docling/` 保存完整的固定版本源码，使用 Git subtree 维护；普通 clone/pull
+即可取得，不需要另管一个源码仓库。解析功能默认关闭，原有 API/MCP 和原生同步无需
+Docling 或模型。显式启用后，worker 只发送文件字节给无网络的独立解析容器。
+支持 PDF/扫描件、PNG/JPEG/TIFF、DOCX/XLSX/PPTX；文本、Markdown、飞书原生资料仍走原生解析。
+
+构建、模型预置、定制、上游升级、权限和回滚说明见
+[解析维护说明](docs/DOCLING-MAINTENANCE.md)，实际验证范围见
+[解析验收记录](docs/DOCLING-VALIDATION.md)。模型权重和企业部署配置不进仓库。

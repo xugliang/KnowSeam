@@ -121,10 +121,14 @@ def knowledge_tool_specs() -> tuple[ToolSpec, ...]:
                                "minItems": 1, "maxItems": 32, "uniqueItems": True},
             "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
         }, ("query", "collection_ids")),
-        spec("knowledge.read", "按检索结果的文档编号和版本读取原文分节；版本必须来自检索结果。", {
+        spec("knowledge.read", "按检索结果的 document_id 和 version_id 顺序读取原文 chunk（不是重新搜索）。"
+             "limit 每次为1至100，默认50；需要继续时将返回的 next_offset 作为下一次 offset，"
+             "保持文档和版本不变，next_offset 为 null 表示读完。不得传 limit=200 等超限值。", {
             "document_id": dict(_ID_SCHEMA), "version_id": dict(_ID_SCHEMA),
-            "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0,
+                       "description": "首次为0；继续读取时使用上一次返回的 next_offset。"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50,
+                      "description": "单页最多返回的 chunk 数，非文档数或字符数；上限100。"},
         }, ("document_id", "version_id")),
     )
 

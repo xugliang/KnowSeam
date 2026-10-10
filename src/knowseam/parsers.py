@@ -13,6 +13,42 @@ from .domain import DocumentParser, ParsedDocument, Section, SourceContent, Unsu
 FEISHU_NATIVE_TYPE = "application/vnd.suite.feishu+json"
 
 
+def preflight(content: SourceContent, *, max_bytes=30 * 1024 * 1024):
+    """Shared format checks before any enhanced engine sees the bytes."""
+    if not content.data or len(content.data) > min(max_bytes, 30 * 1024 * 1024):
+        raise UnsupportedDocument("parser_input_limit")
+    extension = PurePath(content.filename).suffix.lower()
+    types = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg',
+             '.jpeg': 'image/jpeg', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+             '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+             '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+             '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation'}
+    if extension in types and content.media_type not in {types[extension], 'application/octet-stream'}:
+        raise UnsupportedDocument("parser_format_mismatch")
+    signatures = {'.pdf': (b'%PDF-',), '.png': (b'\x89PNG\r\n\x1a\n',), '.jpg': (b'\xff\xd8\xff',),
+                  '.jpeg': (b'\xff\xd8\xff',), '.tif': (b'II*\x00', b'MM\x00*'), '.tiff': (b'II*\x00', b'MM\x00*')}
+    if extension in signatures and not any(content.data.startswith(signature) for signature in signatures[extension]):
+        raise UnsupportedDocument("parser_format_mismatch")
+    if extension in {'.docx', '.xlsx', '.pptx'}:
+        try:
+            StructuredDocumentParser()._check_zip(content.data)
+            with zipfile.ZipFile(io.BytesIO(content.data)) as archive:
+                prefix = {'.docx': 'word/', '.xlsx': 'xl/', '.pptx': 'ppt/'}[extension]
+                if '[Content_Types].xml' not in archive.namelist() or not any(name.startswith(prefix) for name in archive.namelist()):
+                    raise UnsupportedDocument("parser_format_mismatch")
+        except (zipfile.BadZipFile, OSError):
+            raise UnsupportedDocument("parser_invalid_office") from None
+    if extension == '.pdf':
+        from pypdf import PdfReader
+        try:
+            if PdfReader(io.BytesIO(content.data)).is_encrypted:
+                raise UnsupportedDocument("parser_encrypted_pdf")
+        except UnsupportedDocument:
+            raise
+        except Exception:
+            raise UnsupportedDocument("parser_invalid_pdf") from None
+
+
 class StructuredDocumentParser(DocumentParser):
     def __init__(self, *, max_bytes: int = 30 * 1024 * 1024,
                  max_expanded_bytes: int = 150 * 1024 * 1024, max_sections: int = 50000):

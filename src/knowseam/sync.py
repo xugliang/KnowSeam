@@ -5,12 +5,15 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import os
+import logging
 import tempfile
 from typing import Any
 
 from .chunking import CHUNKER_VERSION, canonical, chunk_document, digest, parsed_hash
 from .domain import AccessDenied, DocumentParser, Embedder, SourceConnector, UnsupportedDocument
 from .storage import PostgresStore
+
+LOGGER = logging.getLogger("knowseam.sync")
 
 
 class SyncWorker:
@@ -95,10 +98,13 @@ class SyncWorker:
                     counts["unchanged"] += 1
                     continue
                 try:
+                    stage = "fetch"
                     content = await connector.fetch(node)
                     if not content.data or len(content.data) > self.max_file_bytes:
                         raise ValueError("empty or oversized source content")
+                    stage = "parse"
                     parsed = await asyncio.to_thread(self.parser.parse, content)
+                    stage = "chunk"
                     chunks = chunk_document(parsed)
                     if not chunks:
                         raise UnsupportedDocument("no searchable content extracted")
@@ -110,6 +116,7 @@ class SyncWorker:
                         self.store.touch_unchanged(current["id"], node.revision)
                         counts["unchanged"] += 1
                         continue
+                    stage = "embed"
                     cached = self.store.cached_embeddings(self.embedding_identity, self.embedder.dimensions,
                                                           [chunk.content_hash for chunk in chunks])
                     missing = {chunk.content_hash: chunk.embedding_text for chunk in chunks if chunk.content_hash not in cached}
@@ -121,6 +128,7 @@ class SyncWorker:
                             if len(vectors) != len(batch):
                                 raise ValueError("embedding count mismatch")
                             cached.update(zip([item[0] for item in batch], vectors, strict=True))
+                    stage = "publish"
                     raw_path = await asyncio.to_thread(self._archive, content.data)
                     self.store.publish(doc_id=current["id"], node=node, chunks=chunks,
                                        embeddings=[cached[chunk.content_hash] for chunk in chunks],
@@ -131,6 +139,8 @@ class SyncWorker:
                     counts["published"] += 1
                 except Exception as exc:
                     counts["failed"] += 1
+                    LOGGER.warning("document_sync_failed document_id=%s stage=%s category=%s",
+                                   current["id"], stage, type(exc).__name__)
                     # Store only the class, never tokens, source text or vendor exception bodies.
                     self.store.fail_document(current["id"], type(exc).__name__, revoke=isinstance(exc, AccessDenied))
             counts["failed"] += len(snapshot.errors)

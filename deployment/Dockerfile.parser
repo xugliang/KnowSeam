@@ -1,0 +1,26 @@
+FROM python:3.12-slim AS build
+WORKDIR /build
+COPY .build-parser/wheelhouse /wheelhouse
+COPY deployment/requirements-parser.lock /build/requirements-parser.lock
+RUN pip install --no-index --find-links=/wheelhouse --require-hashes -r requirements-parser.lock
+COPY third_party/docling /build/third_party/docling
+COPY third_party/docling.upstream.json /build/third_party/docling.upstream.json
+COPY scripts/vendor_identity.py /build/scripts/vendor_identity.py
+RUN python scripts/vendor_identity.py third_party/docling --wheel /wheelhouse/docling_slim-2.135.0-py3-none-any.whl \
+    --metadata third_party/docling.upstream.json --lock requirements-parser.lock > /build/parser-build.json \
+    && pip install --no-index --no-deps /wheelhouse/docling_slim-2.135.0-py3-none-any.whl
+
+FROM python:3.12-slim
+RUN useradd --uid 10001 --create-home parser \
+    && mkdir -p /run/knowseam-parser /app \
+    && chown 10001:10001 /run/knowseam-parser
+COPY --from=build /usr/local /usr/local
+COPY --from=build /build/parser-build.json /app/parser-build.json
+COPY --chown=10001:10001 src/knowseam/domain.py /app/src/knowseam/domain.py
+COPY --chown=10001:10001 src/knowseam/parsers.py /app/src/knowseam/parsers.py
+COPY --chown=10001:10001 src/knowseam/document_parsing /app/src/knowseam/document_parsing
+ENV PYTHONPATH=/app/src HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+USER 10001:10001
+RUN python -c "from knowseam.document_parsing import normalizer; from knowseam.document_parsing.extensions import cleanup, tables"
+WORKDIR /app
+ENTRYPOINT ["python", "-m", "knowseam.document_parsing.executor"]

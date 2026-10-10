@@ -1,0 +1,95 @@
+# %% [markdown]
+# Run conversion with an explicit accelerator configuration (CPU/MPS/CUDA/XPU).
+#
+# What this example does
+# - Shows how to select the accelerator device and thread count.
+# - Enables OCR and table structure to exercise compute paths, and prints timings.
+#
+# How to run
+# - From the repo root: `python docs/examples/run_with_accelerator.py`.
+# - Toggle the commented `AcceleratorOptions` examples to try AUTO/MPS/CUDA/XPU.
+#
+# Notes
+# - EasyOCR does not support `cuda:N` device selection (defaults to `cuda:0`).
+# - `settings.debug.profile_pipeline_timings = True` prints profiling details.
+# - `AcceleratorDevice.MPS` is macOS-only; `CUDA` and `XPU` require a compatible GPU and
+#   CUDA/XPU-enabled PyTorch build. CPU mode works everywhere.
+
+# %%
+
+import os
+from pathlib import Path
+
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.pipeline_options import (
+    PdfPipelineOptions,
+    TableStructureOptions,
+)
+from docling.datamodel.settings import DEFAULT_PAGE_RANGE, settings
+from docling.document_converter import DocumentConverter, PdfFormatOption
+
+# Under CI we limit the conversion to a representative page range to keep the
+# example fast; locally the full document is processed.
+IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
+CI_PAGE_RANGE = (3, 4)
+
+
+def main():
+    data_folder = Path(__file__).parent / "../../tests/data"
+    input_doc_path = data_folder / "pdf/sources/2206.01062.pdf"
+
+    # Explicitly set the accelerator
+    # accelerator_options = AcceleratorOptions(
+    #     num_threads=8, device=AcceleratorDevice.AUTO
+    # )
+    accelerator_options = AcceleratorOptions(
+        num_threads=8, device=AcceleratorDevice.CPU
+    )
+    # accelerator_options = AcceleratorOptions(
+    #     num_threads=8, device=AcceleratorDevice.MPS
+    # )
+    # accelerator_options = AcceleratorOptions(
+    #     num_threads=8, device=AcceleratorDevice.XPU
+    # )
+    # accelerator_options = AcceleratorOptions(
+    #     num_threads=8, device=AcceleratorDevice.CUDA
+    # )
+
+    # EasyOCR doesn't support cuda:N allocation, defaults to cuda:0
+    # accelerator_options = AcceleratorOptions(num_threads=8, device="cuda:1")
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.accelerator_options = accelerator_options
+    pipeline_options.do_ocr = True
+    pipeline_options.do_table_structure = True
+    pipeline_options.table_structure_options = TableStructureOptions(
+        do_cell_matching=True
+    )
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+            )
+        }
+    )
+
+    # Enable the profiling to measure the time spent
+    settings.debug.profile_pipeline_timings = True
+
+    # Convert the document
+    page_range = CI_PAGE_RANGE if IS_CI else DEFAULT_PAGE_RANGE
+    conversion_result = converter.convert(input_doc_path, page_range=page_range)
+    doc = conversion_result.document
+
+    # List with total time per document
+    doc_conversion_secs = conversion_result.timings["pipeline_total"].times
+
+    md = doc.export_to_markdown()
+    print(md)
+    print(f"Conversion secs: {doc_conversion_secs}")
+
+
+if __name__ == "__main__":
+    main()

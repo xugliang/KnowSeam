@@ -1,0 +1,229 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import logging
+import sys
+from collections.abc import Iterable
+from pathlib import Path
+from typing import NamedTuple, Optional, Type
+
+from docling.datamodel.accelerator_options import AcceleratorOptions
+from docling.datamodel.base_models import Page
+from docling.datamodel.document import ConversionResult
+from docling.datamodel.pipeline_options import (
+    EasyOcrOptions,
+    NemotronOcrOptions,
+    OcrAutoOptions,
+    OcrMacOptions,
+    OcrOptions,
+    RapidOcrOptions,
+)
+from docling.exceptions import OcrLanguageNotSupportedError
+from docling.models.base_ocr_model import BaseOcrModel
+from docling.models.stages.ocr.easyocr_model import EasyOcrModel
+from docling.models.stages.ocr.nemotron_ocr_model import NemotronOcrModel
+from docling.models.stages.ocr.ocr_mac_model import OcrMacModel
+from docling.models.stages.ocr.rapid_ocr_model import RapidOcrModel
+
+_log = logging.getLogger(__name__)
+
+_NOT_INSTALLED = "not installed"
+
+
+class _Rejection(NamedTuple):
+    """Why one candidate engine was passed over.
+
+    `is_language` separates "this engine has no model for the requested
+    language" from every other reason -- not installed, no CUDA, wrong
+    platform -- because only the former makes the aggregated failure a
+    language problem.
+    """
+
+    engine: str
+    reason: str
+    is_language: bool
+
+
+class OcrAutoModel(BaseOcrModel):
+    def __init__(
+        self,
+        enabled: bool,
+        artifacts_path: Optional[Path],
+        options: OcrAutoOptions,
+        accelerator_options: AcceleratorOptions,
+    ):
+        super().__init__(
+            enabled=enabled,
+            artifacts_path=artifacts_path,
+            options=options,
+            accelerator_options=accelerator_options,
+        )
+        self.options: OcrAutoOptions
+
+        self._engine: Optional[BaseOcrModel] = None
+        # Why each candidate was passed over, for the aggregated error below.
+        rejected: list[_Rejection] = []
+        if self.enabled:
+            if "darwin" == sys.platform:
+                try:
+                    from ocrmac import ocrmac
+
+                    self._engine = OcrMacModel(
+                        enabled=self.enabled,
+                        artifacts_path=artifacts_path,
+                        options=OcrMacOptions(
+                            mode=self.options.mode,
+                            lang=self.options.lang,
+                        ),
+                        accelerator_options=accelerator_options,
+                    )
+                    _log.info("Auto OCR model selected ocrmac.")
+                except ImportError:
+                    _log.info("ocrmac cannot be used because ocrmac is not installed.")
+                    rejected.append(
+                        _Rejection("ocrmac", _NOT_INSTALLED, is_language=False)
+                    )
+                except OcrLanguageNotSupportedError as exc:
+                    _log.info("Auto OCR: skipping ocrmac: %s", exc)
+                    rejected.append(_Rejection("ocrmac", str(exc), is_language=True))
+
+            if "linux" == sys.platform:
+                try:
+                    import nemotron_ocr.inference.pipeline_v2
+
+                    NemotronOcrModel.validate_runtime(accelerator_options)
+
+                    self._engine = NemotronOcrModel(
+                        enabled=self.enabled,
+                        artifacts_path=artifacts_path,
+                        options=NemotronOcrOptions(
+                            mode=self.options.mode,
+                            lang=self.options.lang,
+                        ),
+                        accelerator_options=accelerator_options,
+                    )
+                    _log.info("Auto OCR model selected nemotron.")
+                except ImportError:
+                    _log.info("Nemotron cannot be used because it is not installed.")
+                    rejected.append(
+                        _Rejection("nemotron", _NOT_INSTALLED, is_language=False)
+                    )
+                except OcrLanguageNotSupportedError as exc:
+                    # Caught before the arm below: OcrLanguageNotSupportedError
+                    # is a BaseError, hence a RuntimeError, and the two must not
+                    # be reported as the same kind of failure.
+                    _log.info("Auto OCR: skipping nemotron: %s", exc)
+                    rejected.append(_Rejection("nemotron", str(exc), is_language=True))
+                except (RuntimeError, FileNotFoundError) as exc:
+                    _log.warning("Nemotron OCR cannot be used: %s", exc)
+                    rejected.append(_Rejection("nemotron", str(exc), is_language=False))
+
+            if self._engine is None:
+                try:
+                    import onnxruntime
+                    from rapidocr import EngineType, RapidOCR  # type: ignore
+
+                    self._engine = RapidOcrModel(
+                        enabled=self.enabled,
+                        artifacts_path=artifacts_path,
+                        options=RapidOcrOptions(
+                            backend="onnxruntime",
+                            mode=self.options.mode,
+                            lang=self.options.lang,
+                        ),
+                        accelerator_options=accelerator_options,
+                    )
+                    _log.info("Auto OCR model selected rapidocr with onnxruntime.")
+                except ImportError:
+                    _log.info(
+                        "rapidocr cannot be used because onnxruntime is not installed."
+                    )
+                    rejected.append(
+                        _Rejection(
+                            "rapidocr (onnxruntime)", _NOT_INSTALLED, is_language=False
+                        )
+                    )
+                except OcrLanguageNotSupportedError as exc:
+                    _log.info("Auto OCR: skipping rapidocr (onnxruntime): %s", exc)
+                    rejected.append(
+                        _Rejection("rapidocr (onnxruntime)", str(exc), is_language=True)
+                    )
+
+            if self._engine is None:
+                try:
+                    import easyocr
+
+                    self._engine = EasyOcrModel(
+                        enabled=self.enabled,
+                        artifacts_path=artifacts_path,
+                        options=EasyOcrOptions(
+                            mode=self.options.mode,
+                            lang=self.options.lang,
+                        ),
+                        accelerator_options=accelerator_options,
+                    )
+                    _log.info("Auto OCR model selected easyocr.")
+                except ImportError:
+                    _log.info("easyocr cannot be used because it is not installed.")
+                    rejected.append(
+                        _Rejection("easyocr", _NOT_INSTALLED, is_language=False)
+                    )
+                except OcrLanguageNotSupportedError as exc:
+                    _log.info("Auto OCR: skipping easyocr: %s", exc)
+                    rejected.append(_Rejection("easyocr", str(exc), is_language=True))
+
+            if self._engine is None:
+                try:
+                    import torch
+                    from rapidocr import EngineType, RapidOCR  # type: ignore
+
+                    self._engine = RapidOcrModel(
+                        enabled=self.enabled,
+                        artifacts_path=artifacts_path,
+                        options=RapidOcrOptions(
+                            backend="torch",
+                            mode=self.options.mode,
+                            lang=self.options.lang,
+                        ),
+                        accelerator_options=accelerator_options,
+                    )
+                    _log.info("Auto OCR model selected rapidocr with torch.")
+                except ImportError:
+                    _log.info(
+                        "rapidocr cannot be used because rapidocr or torch is not installed."
+                    )
+                    rejected.append(
+                        _Rejection(
+                            "rapidocr (torch)", _NOT_INSTALLED, is_language=False
+                        )
+                    )
+                except OcrLanguageNotSupportedError as exc:
+                    _log.info("Auto OCR: skipping rapidocr (torch): %s", exc)
+                    rejected.append(
+                        _Rejection("rapidocr (torch)", str(exc), is_language=True)
+                    )
+
+            if self._engine is None:
+                if any(rejection.is_language for rejection in rejected):
+                    listed = "\n".join(
+                        f"  - {rejection.engine}: {rejection.reason}"
+                        for rejection in rejected
+                    )
+                    raise OcrLanguageNotSupportedError(
+                        "Automatic OCR engine selection",
+                        ", ".join(self.options.lang),
+                        detail=f"No installed engine can serve it:\n{listed}",
+                    )
+                _log.warning("No OCR engine found. Please review the install details.")
+
+    def __call__(
+        self, conv_res: ConversionResult, page_batch: Iterable[Page]
+    ) -> Iterable[Page]:
+        if not self.enabled or self._engine is None:
+            yield from page_batch
+            return
+        yield from self._engine(conv_res, page_batch)
+
+    @classmethod
+    def get_options_type(cls) -> Type[OcrOptions]:
+        return OcrAutoOptions

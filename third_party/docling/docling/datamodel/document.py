@@ -1,0 +1,1241 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import csv
+import json
+import logging
+import platform
+import re
+import sys
+import tarfile
+import zipfile
+from collections.abc import Iterable, Mapping
+from datetime import datetime
+from enum import Enum
+from io import BytesIO
+from pathlib import Path, PurePath
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Literal,
+    NamedTuple,
+    Optional,
+    Type,
+    Union,
+)
+
+import filetype
+
+# DO NOT REMOVE; explicitly exposed from this location
+from docling_core.types.doc import (
+    DocItem,
+    DocItemLabel,
+    DoclingDocument,
+    PictureItem,
+    SectionHeaderItem,
+    Size,
+    TableItem,
+    TextItem,
+)
+from docling_core.utils.file import (
+    FileSizeLimitExceededError,
+    resolve_remote_filename,
+    resolve_source_to_stream,
+)
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    Field,
+    PrivateAttr,
+    TypeAdapter,
+    ValidationError,
+)
+
+from docling.backend.abstract_backend import (
+    AbstractDocumentBackend,
+    PaginatedDocumentBackend,
+)
+from docling.datamodel.backend_options import (
+    BackendOptions,
+    MetsGbsBackendOptions,
+)
+from docling.datamodel.base_models import (
+    AssembledUnit,
+    ConfidenceReport,
+    ConversionStatus,
+    DoclingComponentType,
+    DocumentStream,
+    ErrorItem,
+    FailureCategory,
+    FormatToExtensions,
+    FormatToMimeType,
+    HttpSource,
+    InputFormat,
+    MimeTypeToFormat,
+    Page,
+)
+from docling.datamodel.settings import DocumentLimits
+from docling.exceptions import DocumentLoadError
+from docling.utils.pdf_outline import _PdfOutlineItem
+from docling.utils.profiling import ProfilingItem
+from docling.utils.utils import create_file_hash, safe_version
+
+if TYPE_CHECKING:
+    from docling.datamodel.base_models import BaseFormatOption
+
+_log = logging.getLogger(__name__)
+
+layout_label_to_ds_type = {
+    DocItemLabel.TITLE: "title",
+    DocItemLabel.DOCUMENT_INDEX: "table",
+    DocItemLabel.SECTION_HEADER: "subtitle-level-1",
+    DocItemLabel.CHECKBOX_SELECTED: "checkbox-selected",
+    DocItemLabel.CHECKBOX_UNSELECTED: "checkbox-unselected",
+    DocItemLabel.CAPTION: "caption",
+    DocItemLabel.PAGE_HEADER: "page-header",
+    DocItemLabel.PAGE_FOOTER: "page-footer",
+    DocItemLabel.FOOTNOTE: "footnote",
+    DocItemLabel.TABLE: "table",
+    DocItemLabel.FORMULA: "equation",
+    DocItemLabel.LIST_ITEM: "paragraph",
+    DocItemLabel.CODE: "paragraph",
+    DocItemLabel.PICTURE: "figure",
+    DocItemLabel.TEXT: "paragraph",
+    DocItemLabel.PARAGRAPH: "paragraph",
+    DocItemLabel.FORM: DocItemLabel.FORM.value,
+    DocItemLabel.KEY_VALUE_REGION: DocItemLabel.KEY_VALUE_REGION.value,
+}
+
+_EMPTY_DOCLING_DOC = DoclingDocument(name="dummy")
+
+
+class InputRejection(NamedTuple):
+    """Why an input document was flagged invalid, captured where it is known.
+
+    Set on ``InputDocument`` in ``__init__`` and ``create_invalid`` so the
+    converter can emit a categorized ``ErrorItem`` instead of an empty errors
+    list. Transient plumbing (a private attr), not part of the serialized model.
+    """
+
+    message: str
+    category: FailureCategory
+    # The exception that caused the rejection, when one exists. Lets the
+    # converter re-raise ``ConversionError`` with ``from`` so applications can
+    # classify failures via ``__cause__`` (e.g. an encrypted PDF surfaces the
+    # underlying ``PdfiumError``). See issue #1920.
+    original_error: Optional[BaseException] = None
+
+
+class InputDocument(BaseModel):
+    """A document as an input of a Docling conversion."""
+
+    file: Annotated[
+        PurePath, Field(description="A path representation of the input document.")
+    ]
+    document_hash: Annotated[
+        str,
+        Field(description="A stable hash of the path or stream of the input document."),
+    ]
+    valid: bool = Field(True, description="Whether this is a valid input document.")
+    backend_options: Optional[BackendOptions] = Field(
+        None, description="Custom options for backends."
+    )
+    limits: DocumentLimits = Field(
+        DocumentLimits(), description="Limits in the input document for the conversion."
+    )
+    format: Annotated[InputFormat, Field(description="The document format.")]
+
+    filesize: Optional[int] = Field(
+        None, description="Size of the input file, in bytes."
+    )
+    page_count: int = Field(0, description="Number of pages in the input document.")
+
+    _backend: AbstractDocumentBackend
+    # Reason this input was flagged invalid, if any (transient, not serialized).
+    _rejection: Optional[InputRejection] = PrivateAttr(default=None)
+
+    def __init__(
+        self,
+        path_or_stream: Union[BytesIO, Path],
+        format: InputFormat,
+        backend: Type[AbstractDocumentBackend],
+        backend_options: Optional[BackendOptions] = None,
+        filename: Optional[str] = None,
+        limits: Optional[DocumentLimits] = None,
+    ) -> None:
+        super().__init__(
+            file="",
+            document_hash="",
+            format=InputFormat.PDF,
+            backend_options=backend_options,
+        )  # initialize with dummy values
+        self.limits = limits or DocumentLimits()
+        self.format = format
+
+        try:
+            if isinstance(path_or_stream, Path):
+                self.file = path_or_stream
+                self.filesize = path_or_stream.stat().st_size
+                if self.filesize > self.limits.max_file_size:
+                    self._reject_filesize()
+                else:
+                    self.document_hash = create_file_hash(path_or_stream)
+                    self._init_doc(backend, path_or_stream)
+
+            elif isinstance(path_or_stream, BytesIO):
+                assert filename is not None, (
+                    "Can't construct InputDocument from stream without providing "
+                    "filename arg."
+                )
+                self.file = PurePath(filename)
+                self.filesize = path_or_stream.getbuffer().nbytes
+
+                if self.filesize > self.limits.max_file_size:
+                    self._reject_filesize()
+                else:
+                    self.document_hash = create_file_hash(path_or_stream)
+                    self._init_doc(backend, path_or_stream)
+            else:
+                raise RuntimeError(
+                    f"Unexpected type path_or_stream: {type(path_or_stream)}"
+                )
+
+            # For paginated backends, check if the maximum page count is exceeded.
+            if self.valid and self._backend.is_valid():
+                if self._backend.supports_pagination() and isinstance(
+                    self._backend, PaginatedDocumentBackend
+                ):
+                    self.page_count = self._backend.page_count()
+                    if not self.page_count <= self.limits.max_num_pages:
+                        self.valid = False
+                        self._rejection = InputRejection(
+                            message=(
+                                f"Document has {self.page_count} pages, exceeding the "
+                                f"max_num_pages limit of {self.limits.max_num_pages}."
+                            ),
+                            category=FailureCategory.POLICY,
+                        )
+                    elif self.page_count < self.limits.page_range[0]:
+                        self.valid = False
+                        self._rejection = InputRejection(
+                            message=(
+                                f"Document has {self.page_count} pages, fewer than the "
+                                f"requested page_range start {self.limits.page_range[0]}."
+                            ),
+                            category=FailureCategory.POLICY,
+                        )
+
+        except (FileNotFoundError, OSError) as e:
+            self.valid = False
+            self._rejection = self._rejection or InputRejection(
+                message=f"File {self.file.name} not found or cannot be opened.",
+                category=FailureCategory.SOURCE_UNAVAILABLE,
+                original_error=e,
+            )
+            _log.exception(
+                f"File {self.file.name} not found or cannot be opened.", exc_info=e
+            )
+        except RuntimeError as e:
+            # Local RuntimeErrors (e.g. the "Unexpected type" guard) that aren't a
+            # backend bad-input signal; categorized UNKNOWN. (Backend parse
+            # failures are handled in _init_doc and don't reach here.)
+            self.valid = False
+            self._rejection = self._rejection or InputRejection(
+                message=(
+                    "An unexpected error occurred while opening the document "
+                    f"{self.file.name}."
+                ),
+                category=FailureCategory.UNKNOWN,
+                original_error=e,
+            )
+            _log.exception(
+                "An unexpected error occurred while opening the document "
+                f"{self.file.name}",
+                exc_info=e,
+            )
+
+    @classmethod
+    def create_invalid(
+        cls,
+        *,
+        filename: str,
+        format: InputFormat,
+        filesize: int,
+        limits: Optional[DocumentLimits] = None,
+        rejection: Optional[InputRejection] = None,
+    ) -> "InputDocument":
+        """Build an InputDocument flagged invalid without opening a backend.
+
+        Used when the input is rejected before a stream is available, e.g. an
+        HTTP download aborted for exceeding ``limits.max_file_size``. The normal
+        constructor derives ``filesize`` from the actual path/stream, which is
+        unavailable in that case, so the fields are set explicitly here.
+
+        ``__init__`` is overridden to load from a path/stream and open a backend,
+        so the validated constructor cannot be used to set bare field values;
+        ``model_construct`` is the supported way to do that. Only fields that
+        differ from their declared defaults are passed; the rest (e.g.
+        ``backend_options``, ``page_count``) fall back to those defaults.
+
+        ``rejection`` carries the (message, category) reason so the converter can
+        emit a categorized ``ErrorItem`` instead of an empty errors list.
+        """
+        doc = cls.model_construct(
+            file=PurePath(filename),
+            document_hash="",
+            valid=False,
+            limits=limits or DocumentLimits(),
+            format=format,
+            filesize=filesize,
+        )
+        doc._rejection = rejection
+        return doc
+
+    def _reject_filesize(self) -> None:
+        self.valid = False
+        self._rejection = InputRejection(
+            message=(
+                f"File size {self.filesize} exceeds the max_file_size limit of "
+                f"{self.limits.max_file_size} bytes."
+            ),
+            category=FailureCategory.POLICY,
+        )
+
+    def _init_doc(
+        self,
+        backend: Type[AbstractDocumentBackend],
+        path_or_stream: Union[BytesIO, Path],
+    ) -> None:
+        try:
+            if self.backend_options:
+                self._backend = backend(
+                    self,
+                    path_or_stream=path_or_stream,
+                    options=self.backend_options,
+                )
+            else:
+                self._backend = backend(self, path_or_stream=path_or_stream)
+        except Exception as exc:
+            # A DocumentLoadError (bad input bytes) is recorded as a
+            # BACKEND_FAILURE rejection, like the is_valid() branch below.
+            # Anything else (missing dependency, bug) propagates so an internal
+            # defect is not mislabeled.
+            if not isinstance(exc, DocumentLoadError):
+                raise
+            self.valid = False
+            self._rejection = InputRejection(
+                message=str(exc) or "The document backend could not parse the input.",
+                category=FailureCategory.BACKEND_FAILURE,
+                original_error=exc,
+            )
+            return
+
+        if not self._backend.is_valid():
+            self.valid = False
+            self._rejection = InputRejection(
+                message="The document backend could not parse the input.",
+                category=FailureCategory.BACKEND_FAILURE,
+            )
+
+
+def get_input_rejection_cause(in_doc: "InputDocument") -> Optional[BaseException]:
+    """Return the exception behind an invalid input document, if one exists.
+
+    Companion to ``build_invalid_input_errors``: lets the converter raise
+    ``ConversionError`` with ``from`` so the original backend exception (e.g.
+    ``PdfiumError`` for an encrypted PDF) stays reachable via ``__cause__``
+    for programmatic error classification. See issue #1920.
+    """
+    rejection = in_doc._rejection
+    if rejection is None:
+        return None
+    return rejection.original_error
+
+
+def build_invalid_input_errors(in_doc: "InputDocument") -> list[ErrorItem]:
+    """Build the ErrorItem list for an invalid input document.
+
+    Surfaces the rejection reason captured during construction so the document
+    reaches the user as a categorized error instead of an empty errors list.
+    Falls back to a generic UNKNOWN entry if no reason was recorded.
+    """
+    rejection = in_doc._rejection
+    if rejection is None:
+        return [
+            ErrorItem(
+                component_type=DoclingComponentType.USER_INPUT,
+                module_name="",
+                error_message="Input document is not valid.",
+                category=FailureCategory.UNKNOWN,
+            )
+        ]
+    return [
+        ErrorItem(
+            component_type=DoclingComponentType.USER_INPUT,
+            module_name="",
+            error_message=rejection.message,
+            category=rejection.category,
+        )
+    ]
+
+
+class DocumentFormat(str, Enum):
+    V2 = "v2"
+    V1 = "v1"
+
+
+class DoclingVersion(BaseModel):
+    docling_version: str = safe_version("docling")
+    docling_slim_version: str = safe_version("docling-slim")
+    docling_core_version: str = safe_version("docling-core")
+    docling_ibm_models_version: str = safe_version("docling-ibm-models")
+    docling_parse_version: str = safe_version("docling-parse")
+    platform_str: str = platform.platform()
+    py_impl_version: str = sys.implementation.cache_tag
+    py_lang_version: str = platform.python_version()
+
+
+class ConversionAssets(BaseModel):
+    version: DoclingVersion = DoclingVersion()
+    # When the assets were saved (ISO string from datetime.now())
+    timestamp: Optional[str] = None
+
+    status: ConversionStatus = ConversionStatus.PENDING  # failure, success
+    errors: list[ErrorItem] = []  # structure to keep errors
+
+    pages: list[Page] = []
+    timings: dict[str, ProfilingItem] = {}
+    confidence: ConfidenceReport = Field(default_factory=ConfidenceReport)
+
+    document: DoclingDocument = _EMPTY_DOCLING_DOC
+
+    def has_errors(self, category: Optional[FailureCategory] = None) -> bool:
+        """Whether any error was recorded.
+
+        Args:
+            category: If given, only errors of this category count; otherwise
+                any recorded error qualifies.
+        """
+        if category is None:
+            return bool(self.errors)
+        return any(e.category == category for e in self.errors)
+
+    def has_timeout_errors(self) -> bool:
+        """Whether any error has category TIMEOUT."""
+        return self.has_errors(FailureCategory.TIMEOUT)
+
+    def has_inference_errors(self) -> bool:
+        """Whether any error has category INFERENCE_FAILURE."""
+        return self.has_errors(FailureCategory.INFERENCE_FAILURE)
+
+    def has_parse_errors(self) -> bool:
+        """Whether any error has category BACKEND_FAILURE (backend/parse failure)."""
+        return self.has_errors(FailureCategory.BACKEND_FAILURE)
+
+    def save(
+        self,
+        *,
+        filename: Union[str, Path],
+        indent: Optional[int] = 2,
+    ):
+        """Serialize the full ConversionAssets to JSON."""
+        if isinstance(filename, str):
+            filename = Path(filename)
+        # Build an in-memory ZIP archive containing JSON for each asset
+        buf = BytesIO()
+
+        def to_jsonable(obj):
+            try:
+                # pydantic v2 models
+                if hasattr(obj, "model_dump"):
+                    return obj.model_dump(mode="json")  # type: ignore[attr-defined]
+            except TypeError:
+                # some models may not accept mode argument
+                return obj.model_dump()  # type: ignore[attr-defined]
+
+            # enums
+            try:
+                from enum import Enum
+
+                if isinstance(obj, Enum):
+                    return obj.value
+            except Exception:
+                pass
+
+            # containers
+            if isinstance(obj, list):
+                return [to_jsonable(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: to_jsonable(v) for k, v in obj.items()}
+
+            # passthrough primitives
+            return obj
+
+        with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+
+            def write_json(name: str, payload) -> None:
+                data = json.dumps(
+                    to_jsonable(payload), ensure_ascii=False, indent=indent
+                )
+                zf.writestr(name, data.encode("utf-8"))
+
+            # Update and persist a save timestamp
+            self.timestamp = datetime.now().isoformat()
+            write_json("timestamp.json", self.timestamp)
+
+            # Store each component in its own JSON file
+            write_json("version.json", self.version)
+            write_json("status.json", self.status)
+            write_json("errors.json", self.errors)
+            write_json("pages.json", self.pages)
+            write_json("timings.json", self.timings)
+            write_json("confidence.json", self.confidence)
+            # For the document, ensure stable schema via export_to_dict
+            doc_dict = self.document.export_to_dict()
+            zf.writestr(
+                "document.json",
+                json.dumps(doc_dict, ensure_ascii=False, indent=indent).encode("utf-8"),
+            )
+
+        # Persist the ZIP to disk
+        buf.seek(0)
+        if filename.parent and not filename.parent.exists():
+            filename.parent.mkdir(parents=True, exist_ok=True)
+        with filename.open("wb") as f:
+            f.write(buf.getvalue())
+
+    @classmethod
+    def load(cls, filename: Union[str, Path]) -> "ConversionAssets":
+        """Load a ConversionAssets."""
+        if isinstance(filename, str):
+            filename = Path(filename)
+
+        # Read the ZIP and deserialize all items
+        version_info: DoclingVersion = DoclingVersion()
+        timestamp: Optional[str] = None
+        status = ConversionStatus.PENDING
+        errors: list[ErrorItem] = []
+        pages: list[Page] = []
+        timings: dict[str, ProfilingItem] = {}
+        confidence = ConfidenceReport()
+        document: DoclingDocument = _EMPTY_DOCLING_DOC
+
+        with zipfile.ZipFile(filename, mode="r") as zf:
+
+            def read_json(name: str):
+                try:
+                    with zf.open(name, "r") as fp:
+                        return json.loads(fp.read().decode("utf-8"))
+                except KeyError:
+                    return None
+
+            # version
+            if (data := read_json("version.json")) is not None:
+                try:
+                    version_info = DoclingVersion.model_validate(data)
+                except Exception as exc:
+                    _log.error(f"Could not read version: {exc}")
+
+            # timestamp
+            if (data := read_json("timestamp.json")) is not None:
+                if isinstance(data, str):
+                    timestamp = data
+
+            # status
+            if (data := read_json("status.json")) is not None:
+                try:
+                    status = ConversionStatus(data)
+                except Exception:
+                    status = ConversionStatus.PENDING
+
+            # errors
+            if (data := read_json("errors.json")) is not None and isinstance(
+                data, list
+            ):
+                errors = [ErrorItem.model_validate(item) for item in data]
+
+            # pages
+            if (data := read_json("pages.json")) is not None and isinstance(data, list):
+                pages = [Page.model_validate(item) for item in data]
+
+            # timings
+            if (data := read_json("timings.json")) is not None and isinstance(
+                data, dict
+            ):
+                timings = {k: ProfilingItem.model_validate(v) for k, v in data.items()}
+
+            # confidence
+            if (data := read_json("confidence.json")) is not None and isinstance(
+                data, dict
+            ):
+                confidence = ConfidenceReport.model_validate(data)
+
+            # document
+            if (data := read_json("document.json")) is not None and isinstance(
+                data, dict
+            ):
+                document = DoclingDocument.model_validate(data)
+
+        return cls(
+            version=version_info,
+            timestamp=timestamp,
+            status=status,
+            errors=errors,
+            pages=pages,
+            timings=timings,
+            confidence=confidence,
+            document=document,
+        )
+
+
+class ConversionResult(ConversionAssets):
+    input: InputDocument
+    assembled: AssembledUnit = AssembledUnit()
+
+    # PDF bookmark/ToC outline, surfaced from the backend for the heading-hierarchy stage.
+    # Private transient plumbing: a Pydantic private attr (not a model field, never serialized);
+    # the heading stage resets it to None once consumed.
+    _pdf_outline: Optional[list[_PdfOutlineItem]] = PrivateAttr(default=None)
+    # Page sizes recorded while the PDF pipeline produces pages, so that pages which
+    # fail later can still be added to the document with their real size. Kept on the
+    # conversion result (not on the pipeline) because one pipeline instance is shared
+    # by every conversion made through the same DocumentConverter.
+    _page_sizes_by_no: dict[int, Size] = PrivateAttr(default_factory=dict)
+
+
+class _DummyBackend(AbstractDocumentBackend):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def is_valid(self) -> bool:
+        return False
+
+    @classmethod
+    def supported_formats(cls) -> set[InputFormat]:
+        return set()
+
+    @classmethod
+    def supports_pagination(cls) -> bool:
+        return False
+
+    def unload(self):
+        return super().unload()
+
+
+_OFFICE_OPEN_XML_ROOT = "application/vnd.openxmlformats-officedocument"
+
+_ZIP_SUFFIX_MIMETYPES = {
+    ".xlsx": _OFFICE_OPEN_XML_ROOT + ".spreadsheetml.sheet",
+    ".docx": _OFFICE_OPEN_XML_ROOT + ".wordprocessingml.document",
+    ".pptx": _OFFICE_OPEN_XML_ROOT + ".presentationml.presentation",
+    ".pages": FormatToMimeType[InputFormat.IWORK_PAGES][0],
+    ".numbers": FormatToMimeType[InputFormat.IWORK_NUMBERS][0],
+    ".key": FormatToMimeType[InputFormat.IWORK_KEYNOTE][0],
+}
+"""Formats that are ZIP containers, by the extension that tells them apart.
+
+``filetype`` can only see the ZIP, so a member of this family is identified by
+its name and confirmed no further; anything else that arrives as a ZIP is looked
+at inside instead.
+"""
+
+
+class _DocumentConversionInput(BaseModel):
+    path_or_stream_iterator: Iterable[Union[Path, str, DocumentStream, HttpSource]]
+    headers: Optional[dict[str, str]] = None
+    limits: Optional[DocumentLimits] = DocumentLimits()
+
+    def docs(
+        self,
+        format_options: Mapping[InputFormat, "BaseFormatOption"],
+    ) -> Iterable[InputDocument]:
+        for item in self.path_or_stream_iterator:
+            # `backend_input` is what backend_options_for_input() sees: the raw
+            # URL string (not the HttpSource model) so HTML source_uri resolution
+            # keeps working unchanged.
+            backend_input: Union[Path, str, DocumentStream]
+            if isinstance(item, (str, HttpSource)):
+                if isinstance(item, HttpSource):
+                    source_uri = str(item.url)
+                    # Per-source headers override the batch-wide headers; the
+                    # batch dict stays the base so the `headers` arg keeps working.
+                    req_headers = {**(self.headers or {}), **item.headers}
+                else:
+                    source_uri = item
+                    req_headers = self.headers
+                backend_input = source_uri
+                try:
+                    obj = resolve_source_to_stream(
+                        source_uri,
+                        req_headers,
+                        max_file_size=self.limits.max_file_size,
+                    )
+                except FileSizeLimitExceededError as exc:
+                    yield self._build_invalid_input_document(
+                        name=exc.filename,
+                        format_options=format_options,
+                        file_size=exc.size,
+                        rejection=InputRejection(
+                            message=(
+                                f"File size {exc.size} exceeds the max_file_size "
+                                f"limit of {self.limits.max_file_size} bytes."
+                            ),
+                            category=FailureCategory.POLICY,
+                        ),
+                    )
+                    continue
+                except (OSError, ValueError) as exc:
+                    # A source that cannot be fetched or resolved -- unreachable
+                    # URL, HTTP error status, connection/timeout failure, unsafe or
+                    # malformed URL, missing local file, ... -- must not abort the
+                    # whole batch. Emit an invalid InputDocument so it surfaces as a
+                    # document-level FAILURE that still honors raises_on_error
+                    # (i.e. aborts only when abort_on_error is set). requests'
+                    # RequestException subclasses derive from OSError, so this also
+                    # covers all HTTP fetch errors without importing requests here.
+                    _log.error("Failed to resolve input source %r: %s", item, exc)
+                    yield self._build_invalid_input_document(
+                        name=self._filename_from_source(source_uri),
+                        format_options=format_options,
+                        rejection=self._classify_source_error(exc),
+                    )
+                    continue
+            else:
+                obj = item
+                backend_input = item
+            format = self._guess_format(obj)
+            backend: Type[AbstractDocumentBackend]
+            backend_options: Optional[BackendOptions] = None
+            if not format or format not in format_options:
+                _log.error(
+                    f"Input document {obj.name} with format {format} does not match "
+                    f"any allowed format: ({format_options.keys()})"
+                )
+                backend = _DummyBackend
+            else:
+                options = format_options[format]
+                backend = options.backend
+                backend_options = options.backend_options_for_input(backend_input)
+
+            path_or_stream: Union[BytesIO, Path]
+            if isinstance(obj, Path):
+                path_or_stream = obj
+            elif isinstance(obj, DocumentStream):
+                path_or_stream = obj.stream
+            else:
+                raise RuntimeError(f"Unexpected obj type in iterator: {type(obj)}")
+
+            yield InputDocument(
+                path_or_stream=path_or_stream,
+                format=format,  # type: ignore[arg-type]
+                filename=obj.name,
+                limits=self.limits,
+                backend=backend,
+                backend_options=backend_options,
+            )
+
+    def _build_invalid_input_document(
+        self,
+        name: str,
+        format_options: Mapping[InputFormat, "BaseFormatOption"],
+        file_size: int = 0,
+        rejection: Optional[InputRejection] = None,
+    ) -> InputDocument:
+        guessed_format = self._guess_format(DocumentStream(name=name, stream=BytesIO()))
+        if guessed_format is None:
+            guessed_format = next(iter(format_options.keys()))
+
+        return InputDocument.create_invalid(
+            filename=name,
+            format=guessed_format,
+            filesize=file_size,
+            limits=self.limits,
+            rejection=rejection,
+        )
+
+    @staticmethod
+    def _classify_source_error(exc: BaseException) -> InputRejection:
+        """Map a source-resolution failure to an InputRejection.
+
+        Splits HTTP status rejections the same way as the jobkit task path
+        (``_classify_http_status``): policy status codes map to POLICY, every
+        other status or transport failure maps to SOURCE_UNAVAILABLE.
+        ``response.status_code`` is read by duck-typing to avoid a ``requests``
+        import.
+        """
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code in {401, 403, 404, 413, 415, 422}:
+            return InputRejection(message=str(exc), category=FailureCategory.POLICY)
+        return InputRejection(
+            message=str(exc) or "Source document could not be reached.",
+            category=FailureCategory.SOURCE_UNAVAILABLE,
+        )
+
+    @staticmethod
+    def _filename_from_source(source: str) -> str:
+        """Best-effort filename for a source that could not be resolved.
+
+        Reuses docling-core's ``resolve_remote_filename`` for URLs (the same
+        helper ``resolve_source_to_stream`` uses to name successful fetches) so a
+        failed source is labeled consistently; the URL path basename is used with
+        the query string dropped. Non-URL sources fall back to the path basename.
+        """
+        try:
+            http_url = TypeAdapter(AnyHttpUrl).validate_python(source)
+        except ValidationError:
+            return PurePath(source).name or source
+        return resolve_remote_filename(http_url=http_url, response_headers={})
+
+    def _guess_format(self, obj: Union[Path, DocumentStream]) -> Optional[InputFormat]:
+        content = b""  # empty binary blob
+        formats: list[InputFormat] = []
+        obj_ext: Optional[str] = None
+
+        if isinstance(obj, Path):
+            if _DocumentConversionInput._has_doclang_extension(obj.name):
+                return InputFormat.XML_DOCLANG
+            if _DocumentConversionInput._has_dclx_extension(obj.name):
+                return InputFormat.DCLX
+            mime = filetype.guess_mime(str(obj))
+            # Lower-cased so that an upper-case extension (NOTES.VTT, page.HTML)
+            # maps to its format the same way it does for a DocumentStream.
+            obj_ext = obj.suffix[1:].lower() if obj.suffix else ""
+            if mime is None:
+                mime = _DocumentConversionInput._mime_from_extension(obj_ext)
+            needs_content_sniff = mime is None or (
+                mime is not None
+                and mime.lower()
+                in {
+                    "application/octet-stream",
+                    "application/xml",
+                    "application/xhtml+xml",
+                }
+            )
+            if needs_content_sniff:
+                with obj.open("rb") as f:
+                    content = f.read(1024)
+            if mime is not None and mime.lower() == "application/zip":
+                named = _ZIP_SUFFIX_MIMETYPES.get(obj.suffix.lower())
+                if named is not None:
+                    mime = named
+                else:
+                    office_mime = _DocumentConversionInput._detect_office_mime_from_zip(
+                        obj
+                    )
+                    if office_mime is not None:
+                        mime = office_mime
+
+        elif isinstance(obj, DocumentStream):
+            if _DocumentConversionInput._has_doclang_extension(obj.name):
+                return InputFormat.XML_DOCLANG
+            if _DocumentConversionInput._has_dclx_extension(obj.name):
+                return InputFormat.DCLX
+            content = obj.stream.read(8192)
+            obj.stream.seek(0)
+            mime = filetype.guess_mime(content)
+            obj_ext = (
+                obj.name.rsplit(".", 1)[-1]
+                if ("." in obj.name and not obj.name.startswith("."))
+                else ""
+            )
+            if mime is None:
+                mime = _DocumentConversionInput._mime_from_extension(obj_ext.lower())
+            if mime is not None and mime.lower() == "application/zip":
+                named = next(
+                    (
+                        named
+                        for suffix, named in _ZIP_SUFFIX_MIMETYPES.items()
+                        if obj.name.lower().endswith(suffix)
+                    ),
+                    None,
+                )
+                if named is not None:
+                    mime = named
+                else:
+                    office_mime = _DocumentConversionInput._detect_office_mime_from_zip(
+                        obj.stream
+                    )
+                    if office_mime is not None:
+                        mime = office_mime
+
+        mime = _DocumentConversionInput._resolve_ole2_mime(mime, obj_ext)
+
+        if mime is not None and mime.lower() == "application/gzip":
+            if detected_mime := _DocumentConversionInput._detect_mets_gbs(obj):
+                mime = detected_mime
+
+        if not mime or mime.lower() == "application/octet-stream":
+            if detected_afp := _DocumentConversionInput._detect_afp(content):
+                mime = detected_afp
+        mime = mime or _DocumentConversionInput._detect_html_xhtml(content)
+        mime = mime or _DocumentConversionInput._detect_latex(content, obj_ext)
+        mime = mime or _DocumentConversionInput._detect_csv(content)
+        mime = mime or "text/plain"
+        formats = MimeTypeToFormat.get(mime, [])
+        _log.info(f"detected formats: {formats}")
+
+        if formats:
+            if len(formats) == 1 and mime not in ("text/plain"):
+                return formats[0]
+            else:  # ambiguity in formats
+                return _DocumentConversionInput._guess_from_content(
+                    content, mime, formats, ext=obj_ext
+                )
+        else:
+            return None
+
+    @staticmethod
+    def _resolve_ole2_mime(mime: Optional[str], ext: Optional[str]) -> Optional[str]:
+        """Let the extension choose between the OLE2 based legacy Office formats.
+
+        ``filetype`` tells .doc, .ppt and .xls apart from a few bytes after the
+        OLE2 header, which is not conclusive: a file whose first sector is a FAT
+        sector is reported as Excel (or PowerPoint) whatever it really holds.
+        """
+        if mime is None or ext is None:
+            return mime
+        ole2_formats = (InputFormat.DOC, InputFormat.PPT, InputFormat.XLS)
+        ole2_mimes = {m for fmt in ole2_formats for m in FormatToMimeType[fmt]}
+        if mime.lower() not in ole2_mimes:
+            return mime
+        for fmt in ole2_formats:
+            if ext.lower() in FormatToExtensions[fmt]:
+                return FormatToMimeType[fmt][0]
+        return mime
+
+    @staticmethod
+    def _has_doclang_extension(name: str) -> bool:
+        lower_name = name.lower()
+        return lower_name.endswith((".dclg", ".dclg.xml"))
+
+    @staticmethod
+    def _has_dclx_extension(name: str) -> bool:
+        return name.lower().endswith(".dclx")
+
+    @staticmethod
+    def _detect_office_mime_from_zip(
+        source: Union[Path, BytesIO],
+    ) -> Optional[str]:
+        """Detect Office Open XML format by inspecting ZIP archive contents.
+
+        Useful when the filename has no extension (e.g. pre-signed URLs)
+        and filetype only reports ``application/zip``.
+        """
+        try:
+            with zipfile.ZipFile(source) as zf:
+                names = set(zf.namelist())
+                mime_root = "application/vnd.openxmlformats-officedocument"
+                if "word/document.xml" in names:
+                    return mime_root + ".wordprocessingml.document"
+                elif "xl/workbook.xml" in names:
+                    return mime_root + ".spreadsheetml.sheet"
+                elif "ppt/presentation.xml" in names:
+                    return mime_root + ".presentationml.presentation"
+                if "mimetype" in names:
+                    odf_mime = zf.read("mimetype").decode("ascii", errors="ignore")
+                    if odf_mime.startswith("application/vnd.oasis.opendocument."):
+                        return odf_mime.strip()
+        except (zipfile.BadZipFile, OSError):
+            pass
+        finally:
+            if isinstance(source, BytesIO):
+                source.seek(0)
+        return None
+
+    @staticmethod
+    def _has_doclang_root_element(content_str: str) -> bool:
+        """Return whether XML content starts with a DocLang root element."""
+        content_str = re.sub(r"<!--(.*?)-->", "", content_str, flags=re.DOTALL)
+        content_str = content_str.lstrip()
+        if re.match(r"<\?xml", content_str):
+            content_str = re.sub(r"<\?xml[^>]*\?>", "", content_str, count=1).lstrip()
+        return re.match(r"<\s*doclang\b", content_str, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _guess_from_content(
+        content: bytes,
+        mime: str,
+        formats: list[InputFormat],
+        ext: Optional[str] = None,
+    ) -> Optional[InputFormat]:
+        """Guess the input format of a document by checking part of its content."""
+        input_format: Optional[InputFormat] = None
+
+        if mime in {"application/xml", "application/xhtml+xml"}:
+            # ``content`` is a truncated head of the document (see _guess_format),
+            # so it can end mid-codepoint even for well-formed UTF-8, and an XML
+            # document may legitimately declare a non-UTF-8 encoding. Every marker
+            # matched below is ASCII, so replacing undecodable bytes cannot change
+            # the outcome -- while a strict decode would abort the whole batch.
+            content_str = content.decode("utf-8", errors="replace")
+
+            if (
+                InputFormat.XML_XBRL in formats
+                and "http://www.xbrl.org/2003/instance" in content_str
+                and "<xbrl" in content_str.lower()
+            ):
+                return InputFormat.XML_XBRL
+
+            match_doctype = re.search(r"<!DOCTYPE [^>]+>", content_str)
+            if match_doctype:
+                xml_doctype = match_doctype.group()
+                if InputFormat.XML_USPTO in formats and any(
+                    item in xml_doctype.lower()
+                    for item in (
+                        "us-patent-application-v4",
+                        "us-patent-grant-v4",
+                        "us-grant-025",
+                        "patent-application-publication",
+                    )
+                ):
+                    input_format = InputFormat.XML_USPTO
+
+                elif InputFormat.XML_JATS in formats and (
+                    "JATS-journalpublishing" in xml_doctype
+                    or "JATS-archive" in xml_doctype
+                ):
+                    input_format = InputFormat.XML_JATS
+
+            if (
+                input_format is None
+                and InputFormat.XML_DOCLANG in formats
+                and _DocumentConversionInput._has_doclang_root_element(content_str)
+            ):
+                input_format = InputFormat.XML_DOCLANG
+
+        elif mime == "text/plain":
+            content_str = content.decode("utf-8", errors="replace")
+            if InputFormat.XML_USPTO in formats and content_str.startswith(
+                ("PATN\r\n", "PATN\n")
+            ):
+                input_format = InputFormat.XML_USPTO
+            elif (
+                InputFormat.MD in formats
+                and ext is not None
+                and ext.lower() in FormatToExtensions[InputFormat.MD]
+            ):
+                # Only fall back to MD when the extension is a known plain-text
+                # extension (md/txt/text/qmd/rmd). Unknown extensions (e.g. .xyz)
+                # must not be silently treated as Markdown.
+                input_format = InputFormat.MD
+
+        return input_format
+
+    @staticmethod
+    def _mime_from_extension(ext):
+        mime = None
+        if ext in FormatToExtensions[InputFormat.ASCIIDOC]:
+            mime = FormatToMimeType[InputFormat.ASCIIDOC][0]
+        elif ext in FormatToExtensions[InputFormat.HTML]:
+            mime = FormatToMimeType[InputFormat.HTML][0]
+        elif ext in FormatToExtensions[InputFormat.MHTML]:
+            mime = FormatToMimeType[InputFormat.MHTML][0]
+        elif ext in FormatToExtensions[InputFormat.XML_USPTO]:
+            # USPTO text files share the "txt" extension with Markdown. Leave mime=None
+            # so content probing can distinguish PATN text from plain Markdown text.
+            pass
+        elif ext in FormatToExtensions[InputFormat.MD]:
+            mime = FormatToMimeType[InputFormat.MD][0]
+        elif ext in FormatToExtensions[InputFormat.CSV]:
+            mime = FormatToMimeType[InputFormat.CSV][0]
+        elif ext in FormatToExtensions[InputFormat.JSON_DOCLING]:
+            mime = FormatToMimeType[InputFormat.JSON_DOCLING][0]
+        elif ext in FormatToExtensions[InputFormat.BOXNOTE]:
+            mime = FormatToMimeType[InputFormat.BOXNOTE][0]
+        elif ext in FormatToExtensions[InputFormat.EBCDIC]:
+            mime = FormatToMimeType[InputFormat.EBCDIC][0]
+        elif ext in FormatToExtensions[InputFormat.AFP]:
+            mime = FormatToMimeType[InputFormat.AFP][0]
+        elif ext in FormatToExtensions[InputFormat.PDF]:
+            mime = FormatToMimeType[InputFormat.PDF][0]
+        elif ext in FormatToExtensions[InputFormat.DOCX]:
+            mime = FormatToMimeType[InputFormat.DOCX][0]
+        elif ext in FormatToExtensions[InputFormat.DOC]:
+            mime = FormatToMimeType[InputFormat.DOC][0]
+        elif ext in FormatToExtensions[InputFormat.RTF]:
+            mime = FormatToMimeType[InputFormat.RTF][0]
+        elif ext in FormatToExtensions[InputFormat.PPTX]:
+            mime = FormatToMimeType[InputFormat.PPTX][0]
+        elif ext in FormatToExtensions[InputFormat.PPT]:
+            mime = FormatToMimeType[InputFormat.PPT][0]
+        elif ext in FormatToExtensions[InputFormat.XLSX]:
+            mime = FormatToMimeType[InputFormat.XLSX][0]
+        elif ext in FormatToExtensions[InputFormat.XLS]:
+            mime = FormatToMimeType[InputFormat.XLS][0]
+        elif ext in FormatToExtensions[InputFormat.ODT]:
+            mime = FormatToMimeType[InputFormat.ODT][0]
+        elif ext in FormatToExtensions[InputFormat.ODS]:
+            mime = FormatToMimeType[InputFormat.ODS][0]
+        elif ext in FormatToExtensions[InputFormat.ODP]:
+            mime = FormatToMimeType[InputFormat.ODP][0]
+        elif ext in FormatToExtensions[InputFormat.VTT]:
+            mime = FormatToMimeType[InputFormat.VTT][0]
+        elif ext in FormatToExtensions[InputFormat.LATEX]:
+            mime = FormatToMimeType[InputFormat.LATEX][0]
+        elif ext in FormatToExtensions[InputFormat.EMAIL]:
+            mime = (
+                "application/vnd.ms-outlook"
+                if ext == "msg"
+                else FormatToMimeType[InputFormat.EMAIL][0]
+            )
+        return mime
+
+    @staticmethod
+    def _detect_afp(content: bytes) -> Optional[str]:
+        """Detect an AFP MO:DCA structured-field introducer.
+
+        The two-byte length excludes the leading X'5A' carriage-control byte and
+        includes the eight-byte structured-field introducer. Only the header is
+        required here because format sniffing reads a bounded prefix of the file.
+        """
+        if len(content) < 9 or content[0] != 0x5A:
+            return None
+        field_length = int.from_bytes(content[1:3], byteorder="big")
+        if not 8 <= field_length <= 32767 or content[3] != 0xD3:
+            return None
+        return FormatToMimeType[InputFormat.AFP][0]
+
+    @staticmethod
+    def _detect_html_xhtml(
+        content: bytes,
+    ) -> Optional[Literal["application/xhtml+xml", "application/xml", "text/html"]]:
+        """Guess the mime type of an XHTML, HTML, or XML file from its content.
+
+        Args:
+            content: A short piece of a document from its beginning.
+
+        Returns:
+            The mime type of an XHTML, HTML, or XML file, or None if the content does
+              not match any of these formats.
+        """
+        content_str = content.decode("ascii", errors="ignore").lower()
+        # Remove XML comments
+        content_str = re.sub(r"<!--(.*?)-->", "", content_str, flags=re.DOTALL)
+        content_str = content_str.lstrip()
+
+        if re.match(r"<\?xml", content_str):
+            if "xhtml" in content_str[:1000]:
+                return "application/xhtml+xml"
+            else:
+                return "application/xml"
+
+        if re.match(
+            r"(<script.*?>.*?</script>\s*)?(<!doctype\s+html|<html|<head|<body)",
+            content_str,
+            re.DOTALL,
+        ):
+            return "text/html"
+
+        p = re.compile(
+            r"<!doctype\s+(?P<root>[a-zA-Z_:][a-zA-Z0-9_:.-]*)\s+.*>\s*<(?P=root)\b"
+        )
+        if p.search(content_str):
+            return "application/xml"
+
+        if _DocumentConversionInput._has_doclang_root_element(
+            content.decode("utf-8", errors="replace")
+        ):
+            return "application/xml"
+
+        return None
+
+    @staticmethod
+    def _detect_latex(content: bytes, ext: Optional[str] = None) -> Optional[str]:
+        """Guess the mime type of a LaTeX document from its content.
+
+        Args:
+            content: A short piece of a document from its beginning.
+            ext: The file extension, if any. A plain-text extension keeps its
+              Markdown fallback even when the text quotes LaTeX.
+
+        Returns:
+            The LaTeX mime type if a line starts with ``\\documentclass`` (or
+              LaTeX 2.09 ``\\documentstyle``), or None.
+        """
+        if (ext or "").lower() in FormatToExtensions[InputFormat.MD]:
+            return None
+        content_str = content.decode("utf-8", errors="ignore").lstrip("﻿")
+        if re.search(r"^[ \t]*\\document(?:class|style)\b", content_str, re.MULTILINE):
+            return FormatToMimeType[InputFormat.LATEX][0]
+        return None
+
+    @staticmethod
+    def _detect_csv(
+        content: bytes,
+    ) -> Optional[Literal["text/csv"]]:
+        """Guess the mime type of a CSV file from its content.
+
+        Args:
+            content: A short piece of a document from its beginning.
+
+        Returns:
+            The mime type of a CSV file, or None if the content does
+              not match any of the format.
+        """
+        content_str = content.decode("ascii", errors="ignore").strip()
+
+        # Ensure there's at least one newline (CSV is usually multi-line)
+        if "\n" not in content_str:
+            return None
+
+        # Use csv.Sniffer to detect CSV characteristics
+        try:
+            dialect = csv.Sniffer().sniff(content_str)
+            if dialect.delimiter in {",", ";", "\t", "|"}:  # Common delimiters
+                return "text/csv"
+        except csv.Error:
+            return None
+
+        return None
+
+    @staticmethod
+    def _detect_mets_gbs(
+        obj: Union[Path, DocumentStream],
+    ) -> Optional[Literal["application/mets+xml"]]:
+        # Use default limits for safe format detection
+        default_options = MetsGbsBackendOptions()
+        max_file_bytes = default_options.max_file_bytes
+        max_member_count = default_options.max_member_count
+
+        content = obj if isinstance(obj, Path) else obj.stream
+        tar: tarfile.TarFile
+        member: tarfile.TarInfo
+        member_count = 0
+
+        try:
+            with tarfile.open(
+                name=content if isinstance(content, Path) else None,
+                fileobj=content if isinstance(content, BytesIO) else None,
+                mode="r:gz",
+            ) as tar:
+                # Iterate lazily so the member limit applies before all headers are read
+                for member in tar:
+                    member_count += 1
+                    if member_count > max_member_count:
+                        _log.warning(
+                            f"Archive exceeds member count limit ({max_member_count}) during format detection"
+                        )
+                        return None
+
+                    if member.name.endswith(".xml"):
+                        file = tar.extractfile(member)
+                        if file is not None:
+                            xml_content = file.read(max_file_bytes + 1)
+                            if len(xml_content) > max_file_bytes:
+                                _log.warning(
+                                    f"XML file {member.name} exceeds size limit ({max_file_bytes} bytes) during format detection"
+                                )
+                                continue
+
+                            content_str = xml_content.decode(errors="ignore")
+                            if "http://www.loc.gov/METS/" in content_str:
+                                return "application/mets+xml"
+        except Exception as e:
+            _log.warning(f"Error during METS-GBS format detection: {e}")
+            return None
+        finally:
+            if isinstance(content, BytesIO):
+                content.seek(0)
+
+        return None

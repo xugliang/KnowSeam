@@ -1,0 +1,781 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+import shutil
+import sys
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pytest
+
+from docling.backend.noop_backend import NoOpBackend
+from docling.datamodel import asr_model_specs
+from docling.datamodel.accelerator_options import (
+    AcceleratorDevice,
+    AcceleratorOptions,
+)
+from docling.datamodel.base_models import ConversionStatus, InputFormat
+from docling.datamodel.document import ConversionResult, InputDocument
+from docling.datamodel.pipeline_options import AsrPipelineOptions
+from docling.datamodel.pipeline_options_asr_model import (
+    InferenceAsrFramework,
+    InlineAsrMlxWhisperOptions,
+    InlineAsrNativeWhisperOptions,
+)
+from docling.document_converter import AudioFormatOption, DocumentConverter
+from docling.pipeline.asr_pipeline import AsrPipeline
+
+pytestmark = pytest.mark.ml_asr
+
+# pytestmark = pytest.mark.skipif(
+#     sys.version_info >= (3, 14),
+#     reason="Python 3.14 is not yet supported by whisper dependencies.",
+# )
+
+
+@pytest.fixture
+def test_audio_path():
+    return Path("./tests/data/audio/sources/sample_10s.mp3")
+
+
+def get_asr_converter():
+    """Create a DocumentConverter configured for ASR with whisper_turbo model."""
+    pipeline_options = AsrPipelineOptions()
+    pipeline_options.asr_options = asr_model_specs.WHISPER_TINY
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.AUDIO: AudioFormatOption(
+                pipeline_cls=AsrPipeline,
+                pipeline_options=pipeline_options,
+            )
+        }
+    )
+    return converter
+
+
+def test_asr_pipeline_conversion(test_audio_path):
+    """Test ASR pipeline conversion using whisper_turbo model on sample_10s.mp3."""
+    # Check if the test audio file exists
+    assert test_audio_path.exists(), f"Test audio file not found: {test_audio_path}"
+
+    converter = get_asr_converter()
+
+    # Convert the audio file
+    doc_result: ConversionResult = converter.convert(test_audio_path)
+
+    # Verify conversion was successful
+    assert doc_result.status == ConversionStatus.SUCCESS, (
+        f"Conversion failed with status: {doc_result.status}"
+    )
+
+    # Verify we have a document
+    assert doc_result.document is not None, "No document was created"
+
+    # Verify we have text content (transcribed audio)
+    texts = doc_result.document.texts
+    assert len(texts) > 0, "No text content found in transcribed audio"
+
+    # Print transcribed text for verification (optional, for debugging)
+    print(f"Transcribed text from {test_audio_path.name}:")
+    for i, text_item in enumerate(texts):
+        print(f"  {i + 1}: {text_item.text}")
+
+
+@pytest.fixture
+def silent_audio_path():
+    """Fixture to provide the path to a silent audio file."""
+    path = Path("./tests/data/audio/sources/silent_1s.wav")
+    if not path.exists():
+        pytest.skip("Silent audio file for testing not found at " + str(path))
+    return path
+
+
+def test_asr_pipeline_with_silent_audio(silent_audio_path):
+    """
+    Test that the ASR pipeline correctly handles silent audio files
+    by returning a PARTIAL_SUCCESS status.
+    """
+    converter = get_asr_converter()
+    doc_result: ConversionResult = converter.convert(silent_audio_path)
+
+    # Accept PARTIAL_SUCCESS or SUCCESS depending on runtime behavior
+    assert doc_result.status in (
+        ConversionStatus.PARTIAL_SUCCESS,
+        ConversionStatus.SUCCESS,
+    )
+
+
+def test_has_text_and_determine_status_helpers():
+    """Unit-test _has_text and _determine_status on a minimal ConversionResult."""
+    pipeline_options = AsrPipelineOptions()
+    pipeline_options.asr_options = asr_model_specs.WHISPER_TINY
+    # Avoid importing torch in decide_device by forcing CPU-only native path
+    pipeline_options.asr_options = asr_model_specs.WHISPER_TINY_NATIVE
+    pipeline = AsrPipeline(pipeline_options)
+
+    # Create an empty ConversionResult with proper InputDocument
+    doc_path = Path("./tests/data/audio/sources/sample_10s.mp3")
+
+    input_doc = InputDocument(
+        path_or_stream=doc_path,
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    # Simulate run result with empty document/texts
+    conv_res.status = ConversionStatus.SUCCESS
+    assert pipeline._has_text(conv_res.document) is False
+    assert pipeline._determine_status(conv_res) in (
+        ConversionStatus.PARTIAL_SUCCESS,
+        ConversionStatus.SUCCESS,
+        ConversionStatus.FAILURE,
+    )
+
+    # Now make a document with whitespace-only text to exercise empty detection
+    conv_res.document.texts = []
+    conv_res.errors = []
+    assert pipeline._has_text(conv_res.document) is False
+
+    # Emulate non-empty
+    class _T:
+        def __init__(self, t):
+            self.text = t
+
+    conv_res.document.texts = [_T("   "), _T("ok")]
+    assert pipeline._has_text(conv_res.document) is True
+
+
+def test_is_backend_supported_noop_backend():
+    class _Dummy:
+        pass
+
+    # Create a proper NoOpBackend instance
+    doc_path = Path("./tests/data/audio/sources/sample_10s.mp3")
+    input_doc = InputDocument(
+        path_or_stream=doc_path,
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+    )
+    noop_backend = NoOpBackend(input_doc, doc_path)
+
+    assert AsrPipeline.is_backend_supported(noop_backend) is True
+    assert AsrPipeline.is_backend_supported(_Dummy()) is False
+
+
+def test_native_and_mlx_transcribe_language_handling(monkeypatch, tmp_path):
+    """Cover language None/empty handling in model.transcribe wrappers."""
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel, _NativeWhisperModel
+
+    # Native
+    opts_n = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="",
+    )
+    m = _NativeWhisperModel(
+        True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts_n
+    )
+    m.model = Mock()
+    m.verbose = False
+    m.word_timestamps = False
+    # ensure language mapping occurs and transcribe is called
+    m.model.transcribe.return_value = {"segments": []}
+    m.transcribe(tmp_path / "a.wav")
+    m.model.transcribe.assert_called()
+
+    # MLX
+    opts_m = InlineAsrMlxWhisperOptions(
+        repo_id="mlx-community/whisper-tiny-mlx",
+        inference_framework=InferenceAsrFramework.MLX,
+        language="",
+    )
+    with patch.dict("sys.modules", {"mlx_whisper": Mock()}):
+        mm = _MlxWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts_m
+        )
+        mm.mlx_whisper = Mock()
+        mm.mlx_whisper.transcribe.return_value = {"segments": []}
+        mm.transcribe(tmp_path / "b.wav")
+        mm.mlx_whisper.transcribe.assert_called()
+
+
+def test_native_whisper_passes_decode_options_to_transcribe(tmp_path):
+    """Native Whisper forwards decoding options to whisper.transcribe."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        word_timestamps=False,
+        beam_size=3,
+        condition_on_previous_text=False,
+    )
+
+    with patch.dict("sys.modules", {"whisper": Mock()}):
+        model = _NativeWhisperModel(
+            enabled=True,
+            artifacts_path=None,
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            asr_options=opts,
+        )
+
+    model.model = Mock()
+    model.model.transcribe.return_value = {"segments": []}
+
+    model.transcribe(tmp_path / "sample.wav")
+
+    model.model.transcribe.assert_called_once()
+    call_kwargs = model.model.transcribe.call_args.kwargs
+
+    assert call_kwargs["beam_size"] == 3
+    assert call_kwargs["condition_on_previous_text"] is False
+
+
+def test_native_init_with_artifacts_path_and_device_logging(tmp_path):
+    """Cover _NativeWhisperModel init path with artifacts_path passed."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+    # Patch out whisper import side-effects during init by stubbing decide_device path only
+    model = _NativeWhisperModel(
+        True, tmp_path, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+    )
+    # swap real model for mock to avoid actual load
+    model.model = Mock()
+    assert model.enabled is True
+
+
+def test_native_distil_artifacts_path_missing_checkpoint_raises(tmp_path):
+    """artifacts_path set but checkpoint absent must fail loudly, not download."""
+    from docling.pipeline.asr_transcriber import _NativeWhisperModel
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="distil-small.en",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+    with pytest.raises(FileNotFoundError, match="does not contain"):
+        _NativeWhisperModel(
+            True, tmp_path, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+        )
+
+
+def test_native_run_success_with_bytesio_builds_document(tmp_path):
+    """Cover _NativeWhisperModel.run with BytesIO input and success path."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    # Prepare InputDocument with BytesIO
+    audio_bytes = BytesIO(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=audio_bytes,
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+        filename="a.wav",
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    # Model with mocked underlying whisper
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=True,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+    model = _NativeWhisperModel(
+        True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+    )
+    model.model = Mock()
+    model.verbose = False
+    model.word_timestamps = True
+    model.model.transcribe.return_value = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "hi",
+                "words": [{"start": 0.0, "end": 0.5, "word": "hi"}],
+            }
+        ]
+    }
+
+    out = model.run(conv_res)
+    # Status is determined later by pipeline; here we validate document content
+    assert out.document is not None
+    assert len(out.document.texts) >= 1
+
+
+def test_native_run_failure_sets_status(tmp_path):
+    """Cover _NativeWhisperModel.run failure path when transcribe raises."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    # Create a real file so backend initializes
+    audio_path = tmp_path / "a.wav"
+    audio_path.write_bytes(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=audio_path, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+    model = _NativeWhisperModel(
+        True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+    )
+    model.model = Mock()
+    model.model.transcribe.side_effect = RuntimeError("boom")
+
+    out = model.run(conv_res)
+    assert out.status.name == "FAILURE"
+
+
+def test_native_whisper_reports_missing_ffmpeg_before_transcription(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"not real mp3 data")
+    input_doc = InputDocument(
+        path_or_stream=audio_path,
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    options = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=False,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+    model = _NativeWhisperModel(
+        enabled=False,
+        artifacts_path=None,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+        asr_options=options,
+    )
+    model.model = Mock()
+    model.model.transcribe.return_value = {"segments": []}
+    model.verbose = False
+    model.word_timestamps = False
+
+    monkeypatch.setattr(shutil, "which", lambda executable: None)
+
+    out = model.run(conv_res)
+
+    assert out.status == ConversionStatus.FAILURE
+    assert len(out.errors) == 1
+    assert "FFmpeg is required" in out.errors[0].error_message
+    assert "PATH" in out.errors[0].error_message
+    model.model.transcribe.assert_not_called()
+
+
+def test_mlx_whisper_reports_missing_ffmpeg_before_transcription(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel
+
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"not real mp3 data")
+    input_doc = InputDocument(
+        path_or_stream=audio_path,
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    options = InlineAsrMlxWhisperOptions(
+        repo_id="mlx-community/whisper-tiny",
+        inference_framework=InferenceAsrFramework.MLX,
+        language="en",
+        task="transcribe",
+        word_timestamps=False,
+        no_speech_threshold=0.6,
+        logprob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+    )
+    mlx_whisper = Mock()
+    with patch.dict("sys.modules", {"mlx_whisper": mlx_whisper}):
+        model = _MlxWhisperModel(
+            enabled=True,
+            artifacts_path=None,
+            accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+            asr_options=options,
+        )
+
+    monkeypatch.setattr(shutil, "which", lambda executable: None)
+
+    out = model.run(conv_res)
+
+    assert out.status == ConversionStatus.FAILURE
+    assert len(out.errors) == 1
+    assert "FFmpeg is required" in out.errors[0].error_message
+    assert "PATH" in out.errors[0].error_message
+    mlx_whisper.transcribe.assert_not_called()
+
+
+def test_mlx_run_materializes_document_stream(monkeypatch) -> None:
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel
+
+    audio_data = b"RIFF....WAVE"
+    input_doc = InputDocument(
+        path_or_stream=BytesIO(audio_data),
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+        filename="recording.ogg",
+    )
+    conv_res = ConversionResult(input=input_doc)
+    options = InlineAsrMlxWhisperOptions(
+        repo_id="mlx-community/whisper-tiny",
+        inference_framework=InferenceAsrFramework.MLX,
+        language="en",
+    )
+    model = _MlxWhisperModel(
+        enabled=False,
+        artifacts_path=None,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+        asr_options=options,
+    )
+    audio_path: Path | None = None
+
+    def transcribe(path: Path):
+        nonlocal audio_path
+        audio_path = path
+        assert path.suffix == ".ogg"
+        assert path.read_bytes() == audio_data
+        return []
+
+    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(model, "transcribe", transcribe)
+
+    out = model.run(conv_res)
+
+    assert out.status == ConversionStatus.SUCCESS
+    assert audio_path is not None
+    assert not audio_path.exists()
+
+
+def test_mlx_run_removes_document_stream_file_after_failure(monkeypatch) -> None:
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel
+
+    input_doc = InputDocument(
+        path_or_stream=BytesIO(b"RIFF....WAVE"),
+        format=InputFormat.AUDIO,
+        backend=NoOpBackend,
+        filename="recording.wav",
+    )
+    conv_res = ConversionResult(input=input_doc)
+    options = InlineAsrMlxWhisperOptions(
+        repo_id="mlx-community/whisper-tiny",
+        inference_framework=InferenceAsrFramework.MLX,
+        language="en",
+    )
+    model = _MlxWhisperModel(
+        enabled=False,
+        artifacts_path=None,
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+        asr_options=options,
+    )
+    audio_path: Path | None = None
+    existed_during_transcription = False
+
+    def transcribe(path: Path):
+        nonlocal audio_path, existed_during_transcription
+        audio_path = path
+        existed_during_transcription = path.exists()
+        raise RuntimeError("transcription failed")
+
+    monkeypatch.setattr(shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(model, "transcribe", transcribe)
+
+    out = model.run(conv_res)
+
+    assert out.status == ConversionStatus.FAILURE
+    assert existed_during_transcription
+    assert audio_path is not None
+    assert not audio_path.exists()
+
+
+def test_mlx_run_success_and_failure(tmp_path):
+    """Cover _MlxWhisperModel.run success and failure paths."""
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel
+
+    # Success path
+    # Create real files so backend initializes and hashes compute
+    path_ok = tmp_path / "b.wav"
+    path_ok.write_bytes(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=path_ok, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res = ConversionResult(input=input_doc)
+    with patch.dict("sys.modules", {"mlx_whisper": Mock()}):
+        opts = InlineAsrMlxWhisperOptions(
+            repo_id="mlx-community/whisper-tiny-mlx",
+            inference_framework=InferenceAsrFramework.MLX,
+            language="en",
+        )
+        model = _MlxWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+        )
+        model.mlx_whisper = Mock()
+        model.mlx_whisper.transcribe.return_value = {
+            "segments": [{"start": 0.0, "end": 1.0, "text": "ok"}]
+        }
+        out = model.run(conv_res)
+        assert out.status.name == "SUCCESS"
+
+    # Failure path
+    path_fail = tmp_path / "c.wav"
+    path_fail.write_bytes(b"RIFF....WAVE")
+    input_doc2 = InputDocument(
+        path_or_stream=path_fail, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res2 = ConversionResult(input=input_doc2)
+    with patch.dict("sys.modules", {"mlx_whisper": Mock()}):
+        opts2 = InlineAsrMlxWhisperOptions(
+            repo_id="mlx-community/whisper-tiny-mlx",
+            inference_framework=InferenceAsrFramework.MLX,
+            language="en",
+        )
+        model2 = _MlxWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts2
+        )
+        model2.mlx_whisper = Mock()
+        model2.mlx_whisper.transcribe.side_effect = RuntimeError("fail")
+        out2 = model2.run(conv_res2)
+        assert out2.status.name == "FAILURE"
+
+
+def test_native_whisper_handles_zero_duration_timestamps(tmp_path):
+    """Tests that _NativeWhisperModel correctly adjusts zero-duration segments."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    # Create a real file so backend initializes
+    audio_path = tmp_path / "test.wav"
+    audio_path.write_bytes(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=audio_path, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=True,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+
+    # Patch whisper import
+    with patch.dict("sys.modules", {"whisper": Mock()}):
+        model = _NativeWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+        )
+        model.model = Mock()
+        model.verbose = False
+        model.word_timestamps = False
+
+        # Mix of valid and zero-duration segments
+        model.model.transcribe.return_value = {
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "valid segment"},
+                {"start": 2.0, "end": 2.0, "text": "zero-duration"},
+                {"start": 3.0, "end": 4.0, "text": "another valid"},
+            ]
+        }
+
+        out = model.run(conv_res)
+
+        # All segments should be present with adjusted durations where needed
+        assert out.document is not None
+        assert len(out.document.texts) == 3
+        assert out.document.texts[0].text == "valid segment"
+        assert out.document.texts[1].text == "zero-duration"
+        assert out.document.texts[2].text == "another valid"
+
+
+def test_mlx_whisper_handles_zero_duration_timestamps(tmp_path):
+    """Tests that _MlxWhisperModel correctly adjusts zero-duration segments."""
+    from docling.pipeline.asr_pipeline import _MlxWhisperModel
+
+    # Create a real file so backend initializes
+    audio_path = tmp_path / "test.wav"
+    audio_path.write_bytes(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=audio_path, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    with patch.dict("sys.modules", {"mlx_whisper": Mock()}):
+        opts = InlineAsrMlxWhisperOptions(
+            repo_id="mlx-community/whisper-tiny-mlx",
+            inference_framework=InferenceAsrFramework.MLX,
+            language="en",
+        )
+        model = _MlxWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+        )
+        model.mlx_whisper = Mock()
+
+        # Mix of valid and zero-duration segments
+        model.mlx_whisper.transcribe.return_value = {
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "valid segment"},
+                {"start": 2.0, "end": 2.0, "text": "zero-duration"},
+                {"start": 3.0, "end": 4.0, "text": "another valid"},
+            ]
+        }
+
+        out = model.run(conv_res)
+
+        # All segments should be present with adjusted durations where needed
+        assert out.document is not None
+        assert len(out.document.texts) == 3
+        assert out.document.texts[0].text == "valid segment"
+        assert out.document.texts[1].text == "zero-duration"
+        assert out.document.texts[2].text == "another valid"
+
+
+def test_native_whisper_skips_empty_zero_duration(tmp_path):
+    """Tests that _NativeWhisperModel skips empty zero-duration segments."""
+    from docling.pipeline.asr_pipeline import _NativeWhisperModel
+
+    audio_path = tmp_path / "test.wav"
+    audio_path.write_bytes(b"RIFF....WAVE")
+    input_doc = InputDocument(
+        path_or_stream=audio_path, format=InputFormat.AUDIO, backend=NoOpBackend
+    )
+    conv_res = ConversionResult(input=input_doc)
+
+    opts = InlineAsrNativeWhisperOptions(
+        repo_id="tiny",
+        inference_framework=InferenceAsrFramework.WHISPER,
+        verbose=False,
+        timestamps=True,
+        word_timestamps=False,
+        temperature=0.0,
+        max_new_tokens=1,
+        max_time_chunk=1.0,
+        language="en",
+    )
+
+    with patch.dict("sys.modules", {"whisper": Mock()}):
+        model = _NativeWhisperModel(
+            True, None, AcceleratorOptions(device=AcceleratorDevice.CPU), opts
+        )
+        model.model = Mock()
+        model.verbose = False
+        model.word_timestamps = False
+
+        # Valid segment with empty zero-duration segments
+        model.model.transcribe.return_value = {
+            "segments": [
+                {"start": 0.0, "end": 1.0, "text": "valid segment"},
+                {"start": 2.0, "end": 2.0, "text": "   "},  # Empty (whitespace only)
+                {"start": 3.0, "end": 3.0, "text": ""},  # Empty
+                {"start": 4.0, "end": 5.0, "text": "another valid"},
+            ]
+        }
+
+        out = model.run(conv_res)
+
+        # Should have two valid segments, empty zero-duration segments skipped
+        assert out.document is not None
+        assert len(out.document.texts) == 2
+        assert out.document.texts[0].text == "valid segment"
+        assert out.document.texts[1].text == "another valid"
+
+
+def test_whisper_language_defaults_to_auto_detect():
+    """Regression for #3892.
+
+    The native and MLX Whisper options defaulted ``language`` to ``"en"``, and
+    every MLX preset pinned ``language="en"`` on top of that, so transcribing
+    non-English audio with the stock presets forced English decoding instead of
+    openai-whisper's own auto-detection (which is what ``language=None``
+    selects). English-only ``.en`` checkpoints are unaffected: whisper forces
+    ``"en"`` for non-multilingual models when no language is given.
+    """
+    assert (
+        InlineAsrNativeWhisperOptions(
+            repo_id="tiny",
+            inference_framework=InferenceAsrFramework.WHISPER,
+        ).language
+        is None
+    )
+    assert (
+        InlineAsrMlxWhisperOptions(
+            repo_id="mlx-community/whisper-tiny-mlx",
+            inference_framework=InferenceAsrFramework.MLX,
+        ).language
+        is None
+    )
+
+    for preset in (
+        asr_model_specs.WHISPER_TINY,
+        asr_model_specs.WHISPER_SMALL,
+        asr_model_specs.WHISPER_MEDIUM,
+        asr_model_specs.WHISPER_BASE,
+        asr_model_specs.WHISPER_LARGE,
+        asr_model_specs.WHISPER_TURBO,
+        asr_model_specs.WHISPER_TINY_MLX,
+        asr_model_specs.WHISPER_SMALL_MLX,
+        asr_model_specs.WHISPER_MEDIUM_MLX,
+        asr_model_specs.WHISPER_BASE_MLX,
+        asr_model_specs.WHISPER_LARGE_MLX,
+        asr_model_specs.WHISPER_TURBO_MLX,
+        asr_model_specs.WHISPER_TINY_NATIVE,
+        asr_model_specs.WHISPER_LARGE_NATIVE,
+    ):
+        assert preset.language is None, preset.repo_id
+
+    # WhisperS2T is deliberately untouched: its English-only repos are
+    # validated against ``language == "en"``.
+    assert asr_model_specs.WHISPER_TINY_S2T.language == "en"

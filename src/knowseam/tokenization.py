@@ -35,7 +35,8 @@ class JiebaTokenizer:
 
     def __init__(
         self, user_dictionary: str | Path | None = None, terms: Iterable[str] = (),
-        *, max_chars: int = 1_000_000, max_tokens: int = 200_000,
+        *, glossary: Iterable[tuple[str, Iterable[str]]] = (),
+        max_chars: int = 1_000_000, max_tokens: int = 200_000,
     ) -> None:
         if isinstance(max_chars, bool) or not isinstance(max_chars, int) or not 1 <= max_chars <= 2_000_000:
             raise TokenizationError("max_chars must be between 1 and 2000000")
@@ -43,7 +44,27 @@ class JiebaTokenizer:
             raise TokenizationError("max_tokens must be between 1 and 500000")
         if isinstance(terms, str):
             raise TokenizationError("terms must be a collection of words, not one string")
-        configured_terms = tuple(DEFAULT_TERMS) + tuple(terms)
+        if isinstance(glossary, (str, bytes)):
+            raise TokenizationError("glossary must be a collection")
+        alias_targets: dict[str, str] = {}
+        glossary_rows: list[tuple[str, tuple[str, ...]]] = []
+        for canonical, aliases in glossary:
+            if not isinstance(canonical, str) or isinstance(aliases, (str, bytes)):
+                raise TokenizationError("invalid enterprise terminology")
+            canonical_name = unicodedata.normalize("NFKC", canonical).strip().lower()
+            alias_names = tuple(unicodedata.normalize("NFKC", alias).strip().lower()
+                                for alias in aliases)
+            if (not canonical_name or len(canonical_name) > 256
+                    or any(not alias or len(alias) > 256 for alias in alias_names)):
+                raise TokenizationError("invalid enterprise terminology")
+            for name in (canonical_name, *alias_names):
+                if name in alias_targets and alias_targets[name] != canonical_name:
+                    raise TokenizationError("ambiguous enterprise terminology")
+                alias_targets[name] = canonical_name
+            glossary_rows.append((canonical_name, alias_names))
+        self._alias_targets = alias_targets
+        self._glossary = tuple(sorted(glossary_rows))
+        configured_terms = tuple(DEFAULT_TERMS) + tuple(terms) + tuple(alias_targets)
         if any(not isinstance(term, str) or not term.strip() or len(term) > 256 for term in configured_terms):
             raise TokenizationError("dictionary terms must be nonempty strings of at most 256 characters")
         if len(configured_terms) > 100_000:
@@ -67,8 +88,11 @@ class JiebaTokenizer:
             except (OSError, UnicodeError):
                 raise TokenizationError("user dictionary must be a readable UTF-8 file of at most 10 MiB") from None
             dictionary_hash = hashlib.sha256(dictionary_bytes).hexdigest()
-        fingerprint = json.dumps({"algorithm": TOKENIZER_ALGORITHM_VERSION, "terms": self._terms,
-                                  "dictionary_sha256": dictionary_hash},
+        fingerprint_data = {"algorithm": TOKENIZER_ALGORITHM_VERSION, "terms": self._terms,
+                            "dictionary_sha256": dictionary_hash}
+        if self._glossary:
+            fingerprint_data["glossary"] = self._glossary
+        fingerprint = json.dumps(fingerprint_data,
                                  ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         self._version = TOKENIZER_ALGORITHM_VERSION + ":" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
         self.max_chars = max_chars
@@ -136,6 +160,13 @@ class JiebaTokenizer:
                         seen.add(encoded)
                 if len(tokens) > self.max_tokens:
                     raise TokenizationError("tokenizer output exceeds token limit")
+            for token in tuple(tokens):
+                canonical = self._alias_targets.get(token)
+                if canonical is not None and canonical not in seen:
+                    tokens.append(canonical)
+                    seen.add(canonical)
+                    if len(tokens) > self.max_tokens:
+                        raise TokenizationError("tokenizer output exceeds token limit")
             return tokens
 
     def fts_text(self, text: str) -> str:

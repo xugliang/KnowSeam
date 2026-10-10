@@ -1,0 +1,10 @@
+{
+  "upstream_url": "https://github.com/docling-project/docling.git",
+  "upstream_ref": "v2.135.0",
+  "upstream_sha": "2b3a00c5bfcd8b218d32e7e9c33d509aeaa0cb56",
+  "subtree_prefix": "third_party/docling",
+  "distribution_name": "docling-slim",
+  "distribution_version": "2.135.0",
+  "license": "MIT",
+  "import_date": "2026-10-09"
+}

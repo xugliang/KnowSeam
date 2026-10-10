@@ -1,0 +1,35 @@
+services:
+  parser:
+    profiles: [docling]
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.parser
+    image: knowseam-parser:docling-2.135.0
+    user: "10001:10001"
+    command: ["--socket", "/run/knowseam-parser/parser.sock", "--model-path", "/models"]
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - parser-socket:/run/knowseam-parser
+      - ../models/docling:/models:ro
+    tmpfs: ["/tmp:uid=10001,gid=10001,size=512m"]
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "2"
+    cpus: 2
+    mem_limit: 4g
+    pids_limit: 256
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; from knowseam.document_parsing.client import ParserClient; c=ParserClient(Path('/run/knowseam-parser/parser.sock')); c.status(); c.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    volumes:
+      - parser-socket:/run/knowseam-parser
+volumes:
+  parser-socket:

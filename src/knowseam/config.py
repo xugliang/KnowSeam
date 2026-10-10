@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
+from .document_parsing.config import ParsingConfig
+
 ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 Identifier = Annotated[str, Field(strict=True, pattern=ID_PATTERN, min_length=1, max_length=128)]
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -140,12 +142,53 @@ class ModelsConfig(_Strict):
     reranker: ModelConfig
 
 
+class EnterpriseTerm(_Strict):
+    """A company-owned canonical name and its explicitly approved aliases."""
+
+    canonical: Annotated[str, Field(strict=True, min_length=1, max_length=256)]
+    aliases: Annotated[tuple[Annotated[str, Field(strict=True, min_length=1, max_length=256)], ...],
+                       Field(max_length=32)] = ()
+    category: Literal["product", "feature", "field", "organization", "other"] = "other"
+
+    @model_validator(mode="after")
+    def validate_names(self):
+        names = (self.canonical, *self.aliases)
+        normalized = [unicodedata.normalize("NFKC", name).strip().lower() for name in names]
+        if (any(not normal or any(unicodedata.category(char).startswith("C") for char in name)
+                for name, normal in zip(names, normalized, strict=True)) or len(normalized) != len(set(normalized))):
+            raise ValueError("enterprise terminology contains blank, control or duplicate names")
+        return self
+
+
+
+
 class TokenizationConfig(_Strict):
     """Deployment vocabulary shared by indexing and querying, never product defaults."""
 
     terms: Annotated[tuple[Annotated[str, Field(strict=True, min_length=1, max_length=256)], ...],
                      Field(max_length=100000)] = ()
+    glossary: Annotated[tuple[EnterpriseTerm, ...], Field(max_length=10000)] = ()
     user_dictionary: Path | None = None
+
+    @field_validator("glossary", mode="before")
+    @classmethod
+    def explicit_glossary_list(cls, values):
+        if not isinstance(values, (list, tuple)):
+            raise ValueError("tokenization glossary must be a list")
+        return values
+
+    @model_validator(mode="after")
+    def unique_glossary_names(self):
+        names: dict[str, str] = {}
+        for entry in self.glossary:
+            canonical = unicodedata.normalize("NFKC", entry.canonical).strip().lower()
+            for value in (entry.canonical, *entry.aliases):
+                name = unicodedata.normalize("NFKC", value).strip().lower()
+                if name in names and names[name] != canonical:
+                    raise ValueError("enterprise terminology maps one name to multiple canonical names")
+                names[name] = canonical
+        return self
+
 
     @field_validator("terms", mode="before")
     @classmethod
@@ -203,6 +246,8 @@ class FeishuSourceConfig(_Strict):
     app_id: Annotated[str, Field(strict=True, min_length=1, max_length=128)]
     app_secret: SecretStr = Field(repr=False)
     root_token: Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9_-]{1,200}$")]
+    excluded_node_tokens: Annotated[tuple[Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9_-]{1,200}$")], ...], Field(max_length=1000)] = ()
+    excluded_object_ids: Annotated[tuple[Annotated[str, Field(strict=True, pattern=r"^[a-z0-9_]+:[A-Za-z0-9_-]{1,200}$")], ...], Field(max_length=1000)] = ()
     wiki_origin: str = "https://www.feishu.cn"
     timeout_seconds: Annotated[float, Field(strict=True, gt=0, le=120, allow_inf_nan=False)] = 20
     max_attempts: Annotated[int, Field(strict=True, ge=1, le=3)] = 3
@@ -237,6 +282,7 @@ class Settings(_Strict):
     clients: Annotated[tuple[ServiceClient, ...], Field(min_length=1, max_length=1000)]
     models: ModelsConfig
     tokenization: TokenizationConfig = Field(default_factory=TokenizationConfig)
+    parsing: ParsingConfig = Field(default_factory=ParsingConfig)
     sources: Annotated[tuple[SourceConfig, ...], Field(max_length=1000)] = ()
     sync_interval_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] = 300
     acl_ttl_seconds: Annotated[int, Field(strict=True, ge=30, le=86400)] = 900

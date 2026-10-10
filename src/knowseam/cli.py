@@ -25,7 +25,12 @@ FULL_RECHECK_SECONDS = 24 * 60 * 60
 def source_config_hash(source) -> str:
     # Credentials are not source semantics. Explicit exclusion is important:
     # SecretStr serialization would otherwise hash a constant mask.
-    return digest(canonical(source.model_dump(mode="json", exclude={"app_secret"})))
+    values = source.model_dump(mode="json", exclude={"app_secret"})
+    # Newly optional empty exclusions must not invalidate every existing source.
+    for key in ("excluded_node_tokens", "excluded_object_ids"):
+        if not values.get(key):
+            values.pop(key, None)
+    return digest(canonical(values))
 
 
 def configure_store(store: PostgresStore, settings: Settings) -> None:
@@ -141,7 +146,9 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
 
         from .tokenization import JiebaTokenizer
         tokenizer = JiebaTokenizer(user_dictionary=settings.tokenization.user_dictionary,
-                                   terms=settings.tokenization.terms)
+                                   terms=settings.tokenization.terms,
+                                   glossary=[(item.canonical, item.aliases)
+                                             for item in settings.tokenization.glossary])
         if args.command == "migrate-bm25":
             await asyncio.to_thread(store.initialize)
             count = await asyncio.to_thread(store.backfill_bm25, tokenizer, company_id=settings.company_id)
@@ -151,7 +158,7 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
         resources.push_async_callback(_close_resource, embedder)
 
         if args.command in {"sync", "worker"}:
-            from .parsers import StructuredDocumentParser
+            from .document_parsing.factory import build_parser
             from .sync import SyncWorker
             await asyncio.to_thread(configure_store, store, settings)
             # Actual non-sensitive embedding call, not a directory-exists probe.
@@ -165,7 +172,15 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
                 resources.push_async_callback(_close_resource, connector)
                 sources.append((source, connector))
             max_bytes = max((source.max_download_bytes for source in settings.sources), default=30 * 1024 * 1024)
-            worker = SyncWorker(store, StructuredDocumentParser(max_bytes=max_bytes), embedder, tokenizer,
+            parser_client = None
+            if settings.parsing.docling.enabled:
+                from .document_parsing.client import ParserClient
+                parser_client = ParserClient(settings.parsing.docling.socket_path,
+                    timeout_seconds=settings.parsing.docling.timeout_seconds, max_bytes=max_bytes)
+                resources.push_async_callback(_close_resource, parser_client)
+            document_parser = await asyncio.to_thread(build_parser, settings.parsing,
+                                                      max_bytes=max_bytes, client=parser_client)
+            worker = SyncWorker(store, document_parser, embedder, tokenizer,
                                 settings.file_root, max_file_bytes=max_bytes)
             if args.command == "sync":
                 outcomes = await sync_round(worker, sources, force=args.force)

@@ -33,6 +33,7 @@ class FeishuWikiConnector(SourceConnector):
                  timeout_seconds: float = 20, max_attempts: int = 3,
                  max_download_bytes: int = 30 * 1024 * 1024, max_nodes: int = 10000,
                  max_pages: int = 1000, max_sheet_cells: int = 2_000_000,
+                 excluded_node_tokens=(), excluded_object_ids=(),
                  sleep=asyncio.sleep):
         if not app_id or not app_secret:
             raise ValueError("Feishu application credentials are required")
@@ -49,6 +50,14 @@ class FeishuWikiConnector(SourceConnector):
             raise ValueError("limits must be positive")
         self.app_id, self.app_secret = app_id, app_secret
         self.root_token, self.wiki_origin = root_token, wiki_origin.rstrip("/")
+        if (not isinstance(excluded_node_tokens, (tuple, list)) or len(excluded_node_tokens) > 1000
+                or not isinstance(excluded_object_ids, (tuple, list)) or len(excluded_object_ids) > 1000):
+            raise ValueError("invalid source exclusions")
+        self.excluded_nodes = frozenset(self._check_token(token) for token in excluded_node_tokens)
+        if any(not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_]+:[A-Za-z0-9_-]{1,200}", value)
+               for value in excluded_object_ids):
+            raise ValueError("invalid excluded object identifier")
+        self.excluded_objects = frozenset(excluded_object_ids)
         self.max_attempts, self.max_download_bytes = max_attempts, max_download_bytes
         self.max_nodes, self.max_pages, self.max_sheet_cells = max_nodes, max_pages, max_sheet_cells
         self.client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds,
@@ -247,6 +256,9 @@ class FeishuWikiConnector(SourceConnector):
                     errors.append("Wiki node limit reached")
                     break
                 visited.add(node_token)
+                if node_token in self.excluded_nodes:
+                    # Explicit node exclusions include their subtree; never fetch ACL/content.
+                    continue
                 token = self._check_token(raw.get("obj_token"))
                 if not isinstance(raw.get("has_child"), bool):
                     raise IncompleteSnapshot("Wiki node missing child enumeration flag")
@@ -254,7 +266,7 @@ class FeishuWikiConnector(SourceConnector):
                 if not isinstance(kind, str) or not re.fullmatch(r"[a-z0-9_]+", kind):
                     raise ValueError("invalid underlying type")
                 key = f"{kind}:{token}"
-                if key not in documents:
+                if key not in documents and key not in self.excluded_objects:
                     public, permission_error = None, ""
                     try:
                         public = await self._public(token, kind)
@@ -286,6 +298,8 @@ class FeishuWikiConnector(SourceConnector):
         return SourceSnapshot(tuple(nodes), not errors, tuple(errors))
 
     async def fetch(self, node):
+        if node.metadata.get("node_token") in self.excluded_nodes or node.external_id in self.excluded_objects:
+            raise AccessDenied("source is excluded from knowledge retrieval")
         token = self._check_token(node.metadata.get("obj_token"))
         kind = node.metadata.get("obj_type")
         if not isinstance(kind, str) or not re.fullmatch(r"[a-z0-9_]+", kind):

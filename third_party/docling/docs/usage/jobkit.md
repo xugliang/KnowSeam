@@ -1,0 +1,133 @@
+Docling's document conversion can be executed as distributed jobs using [Docling Jobkit](https://github.com/docling-project/docling-jobkit).
+
+This library provides:
+
+- Pipelines for running jobs with Kubeflow pipelines, Ray, or locally.
+- Connectors to import and export documents via HTTP endpoints, S3, or Google Drive.
+
+## Usage
+
+### CLI
+
+You can run Jobkit locally via the CLI:
+
+```sh
+uv run docling-jobkit-local [configuration-file-path]
+```
+
+The configuration file defines:
+
+- Docling conversion options (e.g. OCR settings)
+- Source location of input documents
+- Target location for the converted outputs
+
+Example configuration file:
+
+```yaml
+options:               # Example Docling's conversion options
+  do_ocr: false         
+sources:               # Source location (here Google Drive)
+  - kind: google_drive
+    path_id: 1X6B3j7GWlHfIPSF9VUkasN-z49yo1sGFA9xv55L2hSE
+    token_path: "./dev/google_drive/google_drive_token.json" 
+    credentials_path: "./dev/google_drive/google_drive_credentials.json"  
+target:                # Target location (here S3)
+  kind: s3
+  endpoint: localhost:9000
+  verify_ssl: false
+  bucket: docling-target
+  access_key: minioadmin
+  secret_key: minioadmin
+```
+
+## Connectors
+
+Connectors are used to import documents for processing with Docling and to export results after conversion.
+
+The currently supported connectors are:
+
+- HTTP endpoints
+- S3
+- Google Drive
+- Google Cloud Storage
+
+### S3
+
+For S3-compatible services, provide `access_key` and `secret_key` together. On
+AWS, omit both to use the default credential provider chain (for example, an
+ECS task role, EKS workload identity, or EC2 instance profile).
+
+### Google Drive
+
+To use Google Drive as a source or target, you need to enable the API and set up credentials.
+
+Step 1: Enable the [Google Drive API](https://console.cloud.google.com/apis/enableflow?apiid=drive.googleapis.com).
+
+- Go to the Google [Cloud Console](https://console.cloud.google.com/).
+- Search for “Google Drive API” and enable it.
+
+Step 2: [Create OAuth credentials](https://developers.google.com/workspace/drive/api/quickstart/python#authorize_credentials_for_a_desktop_application). 
+
+- Go to APIs & Services > Credentials.
+- Click “+ Create credentials” > OAuth client ID.
+- If prompted, configure the OAuth consent screen with "Audience: External".
+- Select application type: "Desktop app".
+- Create the application
+- Download the credentials JSON and rename it to `google_drive_credentials.json`.
+
+Step 3: Add test users.
+
+- Go to OAuth consent screen > Test users.
+- Add your email address.
+
+Step 4: Edit configuration file.
+
+- Edit `credentials_path` with your path to `google_drive_credentials.json`.
+- Edit `path_id` with your source or target location. It can be obtained from the URL as follows:
+    - Folder: `https://drive.google.com/drive/u/0/folders/1yucgL9WGgWZdM1TOuKkeghlPizuzMYb5` > folder id is `1yucgL9WGgWZdM1TOuKkeghlPizuzMYb5`.
+    - File: `https://docs.google.com/document/d/1bfaMQ18_i56204VaQDVeAFpqEijJTgvurupdEDiaUQw/edit` > document id is `1bfaMQ18_i56204VaQDVeAFpqEijJTgvurupdEDiaUQw`.
+
+Step 5: Authenticate via CLI.
+
+- Run the CLI with your configuration file.
+- A browser window will open for authentication and gerate a token file that will be save on the configured `token_path` and reused for next runs.
+
+### Google Cloud Storage
+
+To use Google Drive as a source or target, you need to enable the API and set up credentials.
+
+Step 1: Enable the [Google Cloud Storage API](https://console.cloud.google.com/apis/enableflow?apiid=storage.com).
+
+- Go to the Google [Cloud Console](https://console.cloud.google.com/).
+- Search for “Google Storage API” and enable it.
+
+Step 2: Create a bucket.
+
+- Go to Cloud Storage > Buckets > "+ Create".
+- Give it a name and create it. This is your `bucket` value in the configuration file
+
+Step 3: Create a service account.
+
+- Go to IAM & Admin > Service Accounts.
+- Click "+ Create service account" and create it.
+- Grant it a role with bucket access: "Storage Object Admin" for source and target use ("Storage Object Viewer" for read-only sources, "Storage Object Creator" for write-only targets)
+
+Step 4: Create a service account key.
+
+- Open the service account > Keys tab.
+- Click “Add key” > “Create new key” > select "JSON".
+- Download the credentials JSON.
+
+Step 5: Edit configuration file.
+
+- Copy the fields from the downloaded JSON into the service_account_key block of your source or target (`project_id`, `private_key_id`, `private_key`, `client_email`, `client_id`, and the `*_uri` / `*_cert_url` fields).
+- Edit `bucket` with your bucket name.
+- Edit `key_prefix` with your source or target location within the bucket. It is an object-name prefix, obtained from the object path as follows:
+  - Folder: `gs://my-docling-bucket/source/` > prefix is `source/`.
+  - File: `gs://my-docling-bucket/target/output/` > prefix is target/output/.
+- Edit project (optional) with your GCP `project ID` for billing / ADC.
+
+Step 6: Run the CLI.
+
+- Run the CLI with your configuration file.
+- If you omit service_account_key, it falls back to Application Default Credentials, e.g. gcloud auth application-default login or Workload Identity on GKE/Cloud Run.

@@ -126,3 +126,28 @@ def test_real_jieba_token_count_limit_and_empty():
     assert JiebaTokenizer().fts_text("  ") == ""
     with pytest.raises(TokenizationError, match="token limit"):
         JiebaTokenizer(max_tokens=1).tokenize("公司 产品 用户")
+
+
+def test_enterprise_glossary_keeps_canonical_name_and_expands_alias():
+    tokenizer = JiebaTokenizer(glossary=[('示例产品甲', ('示例别名甲',))])
+    # Search-mode Jieba may additionally emit meaningful subwords.
+    assert '示例产品甲' in tokenizer.tokenize('示例产品甲')
+    assert '示例产品甲' in tokenizer.tokenize('示例别名甲的功能')
+    assert tokenizer.version != JiebaTokenizer().version
+
+
+def test_enterprise_glossary_config_rejects_ambiguous_aliases():
+    from pydantic import ValidationError
+    from knowseam.config import TokenizationConfig
+
+    valid = TokenizationConfig.model_validate({'glossary': [
+        {'canonical': '示例产品甲', 'aliases': ['示例别名甲'], 'category': 'product'},
+    ]})
+    assert valid.glossary[0].canonical == '示例产品甲'
+    with pytest.raises(ValidationError):
+        TokenizationConfig.model_validate({'glossary': [
+            {'canonical': '示例产品甲', 'aliases': ['同名']},
+            {'canonical': '另一产品', 'aliases': ['同名']},
+        ]})
+    with pytest.raises(ValidationError):
+        TokenizationConfig.model_validate({'glossary': [{'canonical': '  '}]})
