@@ -4,7 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from .domain import Chunk, ParsedDocument
+from bisect import bisect_right
+from .domain import Chunk, ChunkSpan, ParsedDocument
 
 CHUNKER_VERSION = "structure-v4-table-field-aware:1400:120"
 
@@ -17,12 +18,46 @@ def canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def chunk_document(parsed: ParsedDocument, max_chars: int = 1400, overlap: int = 120) -> tuple[Chunk, ...]:
+class _SourceOffsets:
+    """Sparse boundary checkpoints, O(number of chunk boundaries) Python objects.
+
+    CR -> LF keeps width; only CRLF removes a character. C-level bounded counts
+    find the fixed point without building a Python integer for every character.
+    """
+    def __init__(self, raw, left):
+        self.raw, self.normalized, self.original = raw, [0], [left]
+
+    def boundary(self, offset):
+        index = bisect_right(self.normalized, offset) - 1
+        base, original = self.normalized[index], self.original[index]
+        if offset == base:
+            return original
+        raw_offset = original + offset - base
+        while True:
+            next_offset = original + offset - base + self.raw.count('\r\n', original, raw_offset + 1)
+            if next_offset == raw_offset:
+                break
+            raw_offset = next_offset
+        self.normalized.insert(index + 1, offset)
+        self.original.insert(index + 1, raw_offset)
+        return raw_offset
+
+
+def _normalized_source(raw):
+    left = len(raw) - len(raw.lstrip())
+    return raw.strip().replace('\r\n', '\n').replace('\r', '\n'), _SourceOffsets(raw, left)
+
+
+def chunk_document(parsed: ParsedDocument, max_chars: int = 1400, overlap: int = 120,
+                   *, source_spans: bool = False) -> tuple[Chunk, ...]:
     if max_chars < 200 or overlap < 0 or overlap >= max_chars:
         raise ValueError("invalid chunk bounds")
     chunks: list[Chunk] = []
     for section_no, section in enumerate(parsed.sections):
-        text = section.text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if source_spans:
+            text, raw_offsets = _normalized_source(section.text)
+        else:
+            text = section.text.replace("\r\n", "\n").replace("\r", "\n").strip()
         if not text:
             continue
         table_context = ""
@@ -60,9 +95,15 @@ def chunk_document(parsed: ParsedDocument, max_chars: int = 1400, overlap: int =
                            "char_start": offset + start, "char_end": offset + stop}
                 if field:
                     locator['field'] = field
+                spans = ()
+                if source_spans:
+                    spans = (ChunkSpan(f's-{section_no}', raw_offsets.boundary(offset+start),
+                                       raw_offsets.boundary(offset+stop)),)
+                    locator.update(section_id=spans[0].section_id, char_start=spans[0].start_char,
+                                   char_end=spans[0].end_char)
                 ordinal = len(chunks)
                 chunks.append(Chunk(f"c-{ordinal}-{content_hash[:16]}", excerpt, embedding_text,
-                                    content_hash, locator, ordinal, section.heading))
+                                    content_hash, locator, ordinal, section.heading, spans))
                 if stop == len(piece):
                     break
                 start = max(start + 1, stop - overlap)
@@ -71,6 +112,9 @@ def chunk_document(parsed: ParsedDocument, max_chars: int = 1400, overlap: int =
 
 def parsed_hash(parsed: ParsedDocument) -> str:
     # Include structure/locators: equal visible text in a different table/page is not the same evidence.
-    return digest(canonical({"sections": [{"text": s.text, "heading": s.heading, "locator": s.locator}
+    value = {"sections": [{"text": s.text, "heading": s.heading, "locator": s.locator}
                                           for s in parsed.sections],
-                             "warnings": parsed.warnings, "parser_version": parsed.parser_version}))
+                             "warnings": parsed.warnings, "parser_version": parsed.parser_version}
+    if parsed.structure_version == 2:
+        value.update(tables=[t.model_dump(mode='json') for t in parsed.tables], assets=parsed.assets, structure_version=2)
+    return digest(canonical(value))

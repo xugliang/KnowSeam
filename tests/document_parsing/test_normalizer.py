@@ -98,6 +98,8 @@ def test_excel_offsets_and_merged_header_band_preserve_leaf_fields():
     assert len(parsed.sections) == 1
     row = parsed.sections[0]
     assert row.text == 'Product: Widget | Finance / Revenue: 5 | Finance / Cost: 3'
+    assert [c.header_path for c in parsed.tables[0].columns] == [
+        ('Product',), ('Finance', 'Revenue'), ('Finance', 'Cost')]
     assert row.locator['row'] == 12
     assert row.locator['row_in_table'] == 3
     assert row.locator['column_start'] == 4

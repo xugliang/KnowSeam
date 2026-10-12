@@ -61,7 +61,9 @@ def test_empty_exclusions_keep_existing_source_fingerprint():
     from knowseam.cli import source_config_hash
     from knowseam.chunking import digest, canonical
     source = FeishuSourceConfig(type="feishu", id="s", collection_id="c", app_id="a", app_secret="b", root_token="root")
-    old = source.model_dump(mode="json", exclude={"app_secret", "excluded_node_tokens", "excluded_object_ids"})
+    # These optional fields did not exist in the legacy source identity either.
+    old = source.model_dump(mode="json", exclude={"app_secret", "excluded_node_tokens", "excluded_object_ids",
+                                                 "permission_mode", "bindings"})
     assert source_config_hash(source) == digest(canonical(old))
     excluded = source.model_copy(update={"excluded_node_tokens": ("exam",)})
     assert source_config_hash(excluded) != source_config_hash(source)

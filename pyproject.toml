@@ -12,6 +12,8 @@ requires-python = ">=3.11"
 dependencies = ["httpx>=0.27,<1", "pydantic>=2.7,<3", "starlette>=0.41,<1", "uvicorn>=0.30,<1", "psycopg[binary]>=3.2,<4", "jieba==0.42.1", "openpyxl>=3.1,<4", "python-pptx>=1.0,<2", "python-docx>=1.1,<2", "pypdf>=5,<7"]
 
 [project.optional-dependencies]
+graph = ["neo4j==6.4.0"]
+visual-render = ["Pillow>=11.3,<13", "pypdfium2>=4.30,<6"]
 mcp = ["mcp==2.2.0"]
 suiteharness = ["jsonschema>=4.20,<5"]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1", "PyYAML>=6,<7"]
@@ -22,19 +24,18 @@ knowseam = "knowseam.cli:main"
 knowseam-mcp = "knowseam.mcp_server:main"
 knowseam-bridge = "knowseam.bridge:main"
 
-[project.urls]
-Repository = "https://github.com/xugliang/KnowSeam"
-Issues = "https://github.com/xugliang/KnowSeam/issues"
-
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"knowseam.migrations" = ["sql/*.sql"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = ["docling_real: requires vendored runtime and preloaded models or parser socket", "postgres: requires explicitly isolated knowseam_test database"]
+markers = ["docling_real: requires vendored runtime and preloaded models or parser socket", "postgres: requires explicitly isolated knowseam_test database", "visual_real: requires explicit offline model config and approved inference resources"]
 
 [tool.ruff]
 target-version = "py311"

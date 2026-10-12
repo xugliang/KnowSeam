@@ -1,0 +1,22 @@
+{
+  "features": {
+    "catalog": false,
+    "context": false,
+    "tables": false,
+    "coverage": false,
+    "history": false,
+    "query_graph": false,
+    "visual": false
+  },
+  "indexing": {
+    "enabled": false,
+    "mode": "shadow"
+  },
+  "permissions": {
+    "enabled": false
+  },
+  "visual": {
+    "enabled": false,
+    "allow_online": false
+  }
+}

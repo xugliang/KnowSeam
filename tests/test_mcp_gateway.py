@@ -5,6 +5,7 @@ import hashlib
 import socket
 import sys
 import json
+from pathlib import Path
 
 import httpx
 import httpx2
@@ -44,6 +45,12 @@ class Knowledge:
                 "collection_id": "restricted" if document_id == "private" else "public",
                 "sections": [{"text": "内容"}], "citations": []}
 
+    async def read_asset(self, principal, asset_id, version_id):
+        from knowseam.domain import NotFound
+        if not getattr(self,'asset_available',True):
+            raise NotFound('revoked')
+        return b'\x89PNG\r\n\x1a\n'
+
 
 def configuration(**updates):
     return GatewayConfig.model_validate({
@@ -56,11 +63,69 @@ def configuration(**updates):
     })
 
 
-def application(service=None):
+@pytest.mark.asyncio
+async def test_extended_catalog_context_identity_and_narrower_scope():
+    calls = []
+    def response(request):
+        calls.append(request)
+        assert request.headers['x-actor-id'] == 'alice'
+        if request.url.path == '/v1/catalog':
+            return httpx.Response(200, json={'items': [{'collection_id': 'restricted', 'name': 'secret'}]})
+        body = json.loads(request.content)
+        return httpx.Response(200, json={'document_id': body['document_id'], 'version_id': body['version_id'],
+                                        'collection_id': 'restricted', 'ranges': [], 'citations': []})
+    app = create_app(configuration(extended_tools=True), transport=httpx.MockTransport(response))
+    async with http_client(app) as client:
+        tools = (await rpc(client, 'tools/list')).json()['result']['tools']
+        assert {'knowledge_catalog', 'knowledge_context', 'knowledge_capabilities'} <= {t['name'] for t in tools}
+        result = await call(client, 'knowledge_catalog', {'kind': 'product', 'collection_ids': ['restricted']})
+        assert result['structuredContent']['error'] == 'unavailable'
+        assert not calls
+        result = await call(client, 'knowledge_catalog', {'kind': 'product', 'collection_ids': ['public']})
+        assert result['structuredContent']['error'] == 'invalid_upstream_response'
+        result = await call(client, 'knowledge_context', {'document_id': 'doc', 'version_id': 'v', 'chunk_ids': ['c']})
+        assert result['structuredContent']['error'] == 'unavailable'
+
+
+@pytest.mark.asyncio
+async def test_visual_resource_uses_request_identity_and_narrowed_collection_scope():
+    import base64
+    from knowseam.domain import NotFound
+    class VisualKnowledge(Knowledge):
+        async def visual_search(self, principal, body):
+            return {'hits': [], 'visual_status': 'available'}
+        async def read_asset(self, principal, asset_id, version_id):
+            # The REST boundary must narrow the upstream credential before access.
+            self.calls.append(('asset', principal))
+            if asset_id == 'private' or principal.actor_id != 'alice':
+                raise NotFound('not available')
+            assert principal.allowed_collections == ('public',)
+            return b'\x89PNG\r\n\x1a\n'
+    service = VisualKnowledge()
+    api = rest_app(service, [ServiceClient(token=UPSTREAM_TOKEN, company_id='company', product_id='agent',
+                                          allowed_collections=('public','restricted'), actor_ids=('alice','bob'))])
+    app = create_app(configuration(extended_tools=True), transport=httpx.ASGITransport(api))
+    async with http_client(app) as client:
+        tools = (await rpc(client, 'tools/list')).json()['result']['tools']
+        assert 'knowledge_visual_search' in {t['name'] for t in tools}
+        result = await call(client, 'knowledge_visual_search', {'query':'figure', 'collection_ids':['restricted']})
+        assert result['structuredContent']['error'] == 'unavailable'
+        result = (await rpc(client, 'resources/read', {'uri':'knowseam://assets/image/v1'})).json()
+        content = result['result']['contents'][0]
+        assert content['mimeType']=='image/png' and base64.b64decode(content['blob']).startswith(b'\x89PNG')
+        result = (await rpc(client, 'resources/read', {'uri':'knowseam://assets/image/v1'},
+                           headers={'Authorization':'Bearer '+OTHER_TOKEN})).json()
+        assert 'error' in result
+        assert service.calls[-1][1].actor_id=='bob'
+        result = (await rpc(client, 'resources/read', {'uri':'knowseam://assets/private/v1'})).json()
+        assert 'error' in result
+
+
+def application(service=None, *, extended=False):
     service = service or Knowledge()
     api = rest_app(service, [ServiceClient(token=UPSTREAM_TOKEN, company_id="company", product_id="agent",
                                           allowed_collections=("public", "restricted"), actor_ids=("alice", "bob"))])
-    return create_app(configuration(), transport=httpx.ASGITransport(api)), service
+    return create_app(configuration(extended_tools=extended), transport=httpx.ASGITransport(api)), service
 
 
 @asynccontextmanager
@@ -167,8 +232,9 @@ async def test_sdk_real_tcp_end_to_end():
 
 
 @pytest.mark.asyncio
-async def test_stdio_bridge_to_remote_tcp(tmp_path):
-    app, service = application()
+@pytest.mark.parametrize('extended',[False,True])
+async def test_stdio_bridge_to_remote_tcp(tmp_path,extended):
+    app, service = application(extended=extended)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -176,14 +242,25 @@ async def test_stdio_bridge_to_remote_tcp(tmp_path):
     task = asyncio.create_task(server.serve(sockets=[sock]))
     config_file = tmp_path / "client.json"
     config_file.write_text(json.dumps({"url": f"http://127.0.0.1:{port}/mcp", "token": USER_TOKEN,
-                                      "allow_insecure_http": True}), encoding="utf-8")
+                                      "allow_insecure_http": True, "extended_tools":extended}), encoding="utf-8")
     try:
         async with asyncio.timeout(10):
             while not server.started:
                 await asyncio.sleep(.01)
         async with Client(StdioServerParameters(command=sys.executable, args=[
-            "-m", "knowseam.bridge", "--config", str(config_file)]), read_timeout_seconds=15) as client:
-            assert len((await client.list_tools()).tools) == 3
+            "-m", "knowseam.bridge", "--config", str(config_file)],
+            env={"PYTHONPATH":str(Path(__file__).resolve().parents[1]/'src')}), read_timeout_seconds=15) as client:
+            names = {t.name for t in (await client.list_tools()).tools}
+            assert {'knowledge_list','knowledge_read','knowledge_search'} <= names
+            if extended:
+                assert 'knowledge_visual_search' in names
+                resource = await client.read_resource('knowseam://assets/image/v1',cache_mode='bypass')
+                assert resource.contents[0].mime_type=='image/png'
+                service.asset_available=False
+                with pytest.raises(Exception):
+                    await client.read_resource('knowseam://assets/image/v1',cache_mode='bypass')
+            else:
+                assert len(names)==3
             result = await client.call_tool("knowledge_search", {"query": "制度", "collection_ids": ["public"]})
             assert result.structured_content["hits"][0]["actor"] == "alice"
             denied = await client.call_tool("arbitrary_sql", {"query": "DROP TABLE"})

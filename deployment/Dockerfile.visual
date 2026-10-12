@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY .build-visual/wheelhouse /wheelhouse
+COPY deployment/requirements-visual.lock /app/requirements-visual.lock
+RUN pip install --no-index --find-links=/wheelhouse --require-hashes -r requirements-visual.lock \
+    && useradd --uid 10001 --create-home knowseam
+COPY --chown=10001:10001 src /app/src
+ENV PYTHONPATH=/app/src HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HOME=/tmp/hf
+USER 10001:10001
+ENTRYPOINT ["python", "-m", "knowseam.visual.runtime"]

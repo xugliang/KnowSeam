@@ -43,6 +43,21 @@ PATH = ScopePath.product("tenant-one", "feature-assistant")
 SCOPE = RequestScope(PATH, "feishu-ou-actor1", channel_id="feishu")
 
 
+def test_optional_specs_preserve_legacy_and_strict_identity_boundary():
+    from jsonschema import Draft202012Validator
+    assert len(knowledge_tool_specs()) == 3
+    specs = {s.name: s for s in knowledge_tool_specs(extended=True)}
+    assert {'knowledge.context', 'knowledge.catalog', 'knowledge.capabilities'} <= specs.keys()
+    for name in ('knowledge.context', 'knowledge.catalog'):
+        assert specs[name].input_schema['additionalProperties'] is False
+        assert 'actor_id' not in specs[name].input_schema['properties']
+    schema = specs['knowledge.context'].input_schema
+    value = dict(document_id='doc', version_id='v', chunk_ids=['c'])
+    assert Draft202012Validator(schema).is_valid(value)
+    assert not Draft202012Validator(schema).is_valid({**value, 'actor_id': 'admin'})
+    assert not Draft202012Validator(schema).is_valid({**value, 'before': True})
+
+
 class EmptyProductConfig(BaseModel):
     pass
 
@@ -182,6 +197,29 @@ def test_schema_is_strict_read_only_and_token_not_in_repr():
     assert "test-product-service-token" not in repr(config())
     specs[0].input_schema["properties"]["evil"] = {}
     assert knowledge_tool_specs()[0].input_schema["properties"] == {}
+
+
+@async_test
+async def test_visual_tool_is_optional_scoped_and_returns_resources_not_public_paths():
+    specs = knowledge_tool_specs(extended=True)
+    names = {s.name for s in specs}
+    assert 'knowledge.visual_search' in names
+    assert 'knowledge.visual_search' not in {s.name for s in knowledge_tool_specs()}
+    spec = next(s for s in specs if s.name=='knowledge.visual_search')
+    def response(request):
+        assert request.url.path=='/v1/visual/search'
+        assert request.headers['x-actor-id']==SCOPE.principal_id
+        return httpx.Response(200,json={'hits':[{'asset_id':'asset1','collection_id':'collection-1',
+            'document_id':'doc','version_id':'v1','modality':'visual',
+            'resource_uri':'knowseam://assets/asset1/v1'}]})
+    client = KnowledgeHttpClient(config(), PATH, transport=httpx.MockTransport(response))
+    try:
+        value = await KnowledgeTool(client,spec)(context(spec),{'query':'图表','collection_ids':['collection-1']})
+        assert value['hits'][0]['resource_uri']=='knowseam://assets/asset1/v1'
+        with pytest.raises(KnowledgeToolError):
+            await KnowledgeTool(client,spec)(context(spec),{'query':'图表','actor_id':'other'})
+    finally:
+        await client.close()
 
 
 @pytest.mark.parametrize("name,arguments", [

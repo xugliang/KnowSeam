@@ -1,0 +1,31 @@
+{
+  "enabled": false,
+  "uri": "bolt://neo4j:7687",
+  "database": "neo4j",
+  "username": "neo4j",
+  "password": "",
+  "collections": {
+    "public": {
+      "entity_types": ["product", "feature", "team"],
+      "relation_types": ["supports", "owned_by"],
+      "aliases": {},
+      "version": "1"
+    }
+  },
+  "extractor": {
+    "base_url": "http://chat-model:8000/v1",
+    "model_id": "your-chat-model",
+    "model_revision": "pin-your-model-revision",
+    "api_key": "",
+    "allow_online": true,
+    "timeout": 60,
+    "max_chunk_chars": 8000
+  },
+  "hops": 1,
+  "candidate_limit": 40,
+  "include_inferred": false,
+  "min_confidence": 0.7,
+  "poll_seconds": 5,
+  "lease_seconds": 600,
+  "max_attempts": 3
+}

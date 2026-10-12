@@ -2,8 +2,8 @@ from ..parsers import StructuredDocumentParser
 from .config import ParsingConfig
 
 
-def build_parser(settings: ParsingConfig, *, max_bytes: int, client=None):
-    native = StructuredDocumentParser(max_bytes=max_bytes)
+def build_parser(settings: ParsingConfig, *, max_bytes: int, client=None, structured_tables=False):
+    native = StructuredDocumentParser(max_bytes=max_bytes, structured_tables=structured_tables)
     if not settings.docling.enabled:
         return native
     from .docling_adapter import DoclingAdapter

@@ -18,6 +18,9 @@ COPY --from=build /usr/local /usr/local
 COPY --from=build /build/parser-build.json /app/parser-build.json
 COPY --chown=10001:10001 src/knowseam/domain.py /app/src/knowseam/domain.py
 COPY --chown=10001:10001 src/knowseam/parsers.py /app/src/knowseam/parsers.py
+COPY --chown=10001:10001 src/knowseam/identifiers.py /app/src/knowseam/identifiers.py
+COPY --chown=10001:10001 src/knowseam/tables/__init__.py /app/src/knowseam/tables/__init__.py
+COPY --chown=10001:10001 src/knowseam/tables/domain.py /app/src/knowseam/tables/domain.py
 COPY --chown=10001:10001 src/knowseam/document_parsing /app/src/knowseam/document_parsing
 ENV PYTHONPATH=/app/src HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 USER 10001:10001

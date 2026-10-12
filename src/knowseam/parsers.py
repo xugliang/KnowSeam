@@ -6,6 +6,7 @@ import io
 import json
 import re
 import zipfile
+from dataclasses import replace
 from pathlib import PurePath
 
 from .domain import DocumentParser, ParsedDocument, Section, SourceContent, UnsupportedDocument
@@ -51,10 +52,12 @@ def preflight(content: SourceContent, *, max_bytes=30 * 1024 * 1024):
 
 class StructuredDocumentParser(DocumentParser):
     def __init__(self, *, max_bytes: int = 30 * 1024 * 1024,
-                 max_expanded_bytes: int = 150 * 1024 * 1024, max_sections: int = 50000):
+                 max_expanded_bytes: int = 150 * 1024 * 1024, max_sections: int = 50000, structured_tables=False):
         self.max_bytes = max_bytes
         self.max_expanded_bytes = max_expanded_bytes
         self.max_sections = max_sections
+        self.structured_tables = structured_tables
+        self.version = 'structured-v2-tables-1' if structured_tables else 'structured-v1'
 
     def parse(self, content: SourceContent) -> ParsedDocument:
         if len(content.data) > self.max_bytes:
@@ -85,6 +88,42 @@ class StructuredDocumentParser(DocumentParser):
             raise UnsupportedDocument("文档段落数量超过解析限制")
         if sum(len(section.text) for section in result.sections) > self.max_expanded_bytes:
             raise UnsupportedDocument("解析文本超过限制")
+        if self.structured_tables:
+            from .tables.native import extract_tables, from_rows
+            from .tables.domain import validate_tables
+            try:
+                tables = extract_tables(content)
+                if content.media_type == FEISHU_NATIVE_TYPE:
+                    payload = json.loads(content.data)
+                    if payload.get('kind') == 'sheet':
+                        tables = validate_tables(from_rows(f't-{i}', [r['values'] for r in s['rows']], name=s['title'],
+                            locator={'sheet': s['title'], 'sheet_id': s['id']}, unknown=True,
+                            row_numbers=[r['row'] for r in s['rows']]) for i, s in enumerate(payload['sheets'], 1))
+                    elif payload.get('kind') == 'docx':
+                        by_table = {}
+                        for section in result.sections:
+                            if 'row' in section.locator and 'block_id' in section.locator:
+                                by_table.setdefault(section.locator['block_id'], []).append(section)
+                        blocks = {b['block_id']: b for b in payload['blocks']}
+                        def cell_text(key, seen=frozenset()):
+                            if key in seen or key not in blocks:
+                                return ''
+                            b = blocks[key]
+                            return '\n'.join(filter(None, [self._rich_text(b), *(cell_text(c, seen|{key}) for c in b.get('children', []))]))
+                        native = []
+                        for key in by_table:
+                            block = blocks[key]
+                            cols = block['table']['property']['column_size']
+                            cells = block['table'].get('cells', block.get('children', []))
+                            rows = [[cell_text(c) for c in cells[start:start+cols]] for start in range(0, len(cells), cols)]
+                            native.append(from_rows(f't-{len(native)+1}', rows, locator={'block_id': key}, unknown=True))
+                        tables = validate_tables(native)
+                result = replace(result, tables=tables, structure_version=2, parser_version=self.version)
+                from .document_parsing.protocol import encode_document
+                if len(encode_document(result, protocol_version=2)) > self.max_expanded_bytes:
+                    raise ValueError('table output limit')
+            except (ValueError, KeyError, IndexError):
+                raise UnsupportedDocument('parser_invalid_table_structure') from None
         return result
 
     def _check_zip(self, data: bytes) -> None:

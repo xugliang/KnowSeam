@@ -15,6 +15,9 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from .domain import AccessDenied, Chunk, NotFound, Principal, SearchHit, SourceNode
+from .repository import KnowledgeRepository, RetrievalBackend
+from .contracts import StructurePublisher
+from .graph.postgres import GRAPH_SCHEMA, GraphOutboxMixin
 
 
 SCHEMA = """
@@ -83,9 +86,14 @@ def vector_literal(values: Sequence[float], dimensions: int) -> str:
     return "[" + ",".join(format(float(x), ".12g") for x in values) + "]"
 
 
-class PostgresStore:
-    def __init__(self, dsn: str, *, acl_ttl_seconds: int = 900):
+class PostgresStore(GraphOutboxMixin, KnowledgeRepository, RetrievalBackend, StructurePublisher):
+    def __init__(self, dsn: str, *, acl_ttl_seconds: int = 900,
+                 graph_projections: dict[str, str] | None = None, indexing_enabled=False, history_enabled=False):
         self._dsn = dsn
+        self.graph_projections = dict(graph_projections or {})
+        self.indexing_enabled = indexing_enabled
+        self.permissions = None
+        self.history_enabled = history_enabled
         if not 30 <= acl_ttl_seconds <= 86400:
             raise ValueError("ACL TTL must be between 30 and 86400 seconds")
         self.acl_ttl_seconds = acl_ttl_seconds
@@ -97,10 +105,13 @@ class PostgresStore:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.execute(SCHEMA)
+            connection.execute(GRAPH_SCHEMA)
 
     def ready(self) -> bool:
         try:
             with self.connect() as connection:
+                from .indexing.postgres import require_compatible_index
+                require_compatible_index(self, connection)
                 connection.execute("SELECT visibility FROM sk_collections LIMIT 1")
                 connection.execute("SELECT tf FROM sk_chunk_terms LIMIT 1")
                 if connection.execute("SELECT 1 FROM sk_chunks ch JOIN sk_documents d ON d.active_version=ch.version_id "
@@ -108,7 +119,7 @@ class PostgresStore:
                                       "WHERE s.enabled AND d.public AND ch.token_count IS NULL LIMIT 1").fetchone():
                     return False
             return True
-        except psycopg.Error:
+        except (psycopg.Error, RuntimeError):
             return False
 
     def configure(self, *, company_id: str, collections: Sequence[dict], sources: Sequence[dict],
@@ -116,6 +127,8 @@ class PostgresStore:
         with self.connect() as c:
             # Serialize policy replacement, including deployments with no sources.
             c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("acl:" + company_id,))
+            if self.graph_projections:
+                c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", ("graph-ensure:" + company_id,))
             existing = c.execute("SELECT s.id FROM sk_sources s JOIN sk_collections k ON k.id=s.collection_id "
                                  "WHERE k.company_id=%s", (company_id,)).fetchall()
             for source_id in sorted({r["id"] for r in existing} | {r["id"] for r in sources}):
@@ -155,20 +168,32 @@ class PostgresStore:
                     # Relative external IDs may collide after changing a root.
                     # Keep the old version archive, but never serve it as a
                     # fallback for a document observed in the new configuration.
-                    c.execute("UPDATE sk_documents SET public=false,acl_verified_at=NULL,active_version=NULL,"
-                              "source_revision='',status='pending',error_code=NULL WHERE source_id=%s",
-                              (item["id"],))
+                    removed = c.execute("UPDATE sk_documents SET public=false,acl_verified_at=NULL,active_version=NULL,"
+                                        "source_revision='',status='pending',error_code=NULL WHERE source_id=%s RETURNING id",
+                                        (item["id"],)).fetchall()
+                    for row in removed:
+                        self._enqueue_graph(c, row["id"])
                 c.execute("INSERT INTO sk_sources(id,collection_id,config_hash) VALUES(%s,%s,%s) "
                           "ON CONFLICT(id) DO UPDATE SET config_hash=excluded.config_hash,enabled=true",
                           (item["id"], item["collection_id"], item["config_hash"]))
+                if self.permissions is not None:
+                    self.permissions.configure(c, company_id, item)
             # Removed configured sources are immediately excluded, not kept indefinitely.
             configured = [item["id"] for item in sources]
             c.execute("UPDATE sk_sources s SET enabled=false FROM sk_collections k WHERE k.id=s.collection_id "
                       "AND k.company_id=%s AND NOT(s.id=ANY(%s::text[]))", (company_id, configured))
-            c.execute("UPDATE sk_documents d SET public=false,acl_verified_at=NULL "
-                      "FROM sk_sources s JOIN sk_collections k ON k.id=s.collection_id "
-                      "WHERE d.source_id=s.id AND k.company_id=%s AND NOT(s.id=ANY(%s::text[]))",
-                      (company_id, configured))
+            removed = c.execute("UPDATE sk_documents d SET public=false,acl_verified_at=NULL "
+                                "FROM sk_sources s JOIN sk_collections k ON k.id=s.collection_id "
+                                "WHERE d.source_id=s.id AND k.company_id=%s AND NOT(s.id=ANY(%s::text[])) "
+                                "AND (d.public OR d.acl_verified_at IS NOT NULL) RETURNING d.id",
+                                (company_id, configured)).fetchall()
+            for row in removed:
+                if self.permissions is not None:
+                    self.permissions.invalidate(c, row['id'])
+                self._enqueue_graph(c, row["id"])
+
+            if self.graph_projections:
+                self._ensure_graph(c, company_id)
 
     @contextmanager
     def source_lock(self, source_id: str, expected_config_hash: str | None = None):
@@ -188,10 +213,13 @@ class PostgresStore:
             finally:
                 c.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
-    def observe(self, source_id: str, node: SourceNode, scanned_at: datetime) -> dict:
+    def observe(self, source_id: str, node: SourceNode, scanned_at: datetime, *, _observation=None) -> dict:
+        if self.permissions is not None:
+            return self.permissions.observe(source_id, node, scanned_at, _observation)
         doc_id = document_id(source_id, node.external_id)
         public = node.public is True
         with self.connect() as c:
+            old = c.execute("SELECT public,active_version,status FROM sk_documents WHERE id=%s FOR UPDATE", (doc_id,)).fetchone()
             source = c.execute("SELECT enabled FROM sk_sources WHERE id=%s", (source_id,)).fetchone()
             if not source or not source["enabled"]:
                 raise AccessDenied("source disabled")
@@ -202,13 +230,21 @@ class PostgresStore:
                       "status=CASE WHEN excluded.public THEN sk_documents.status ELSE 'unavailable' END",
                       (doc_id, source_id, node.external_id, node.title, node.source_url, public,
                        scanned_at if public else None, scanned_at, Jsonb(node.metadata)))
+            if old and old["public"] != public and (not public or old["status"] in {"ready", "stale"}):
+                self._enqueue_graph(c, doc_id)
             return c.execute("SELECT d.*,v.pipeline_id,v.content_hash,v.raw_hash FROM sk_documents d "
                              "LEFT JOIN sk_versions v ON v.id=d.active_version WHERE d.id=%s", (doc_id,)).fetchone()
 
-    def touch_unchanged(self, doc_id: str, revision: str) -> None:
+    def touch_unchanged(self, doc_id: str, revision: str, *, _permission_revision=None) -> None:
         with self.connect() as c:
-            c.execute("UPDATE sk_documents SET source_revision=%s,status='ready',error_code=NULL WHERE id=%s AND public",
-                      (revision, doc_id))
+            old = c.execute("SELECT status FROM sk_documents WHERE id=%s FOR UPDATE", (doc_id,)).fetchone()
+            if self.permissions is not None:
+                self.permissions.require(c, doc_id, _permission_revision)
+            updated = c.execute("UPDATE sk_documents SET source_revision=%s,status='ready',error_code=NULL "
+                                "WHERE id=%s AND (public OR %s) RETURNING id",
+                                (revision, doc_id, self.permissions is not None)).fetchone()
+            if updated and old["status"] not in {"ready", "stale"}:
+                self._enqueue_graph(c, doc_id)
 
     def fail_document(self, doc_id: str, error_code: str, *, revoke: bool = False) -> None:
         with self.connect() as c:
@@ -216,13 +252,21 @@ class PostgresStore:
                       "error_code=%s,public=CASE WHEN %s THEN false ELSE public END,"
                       "acl_verified_at=CASE WHEN %s THEN NULL ELSE acl_verified_at END WHERE id=%s",
                       (error_code[:100], revoke, revoke, doc_id))
+            if revoke:
+                if self.permissions is not None:
+                    self.permissions.invalidate(c, doc_id)
+                self._enqueue_graph(c, doc_id)
 
     def reconcile(self, source_id: str, seen: Sequence[str]) -> int:
         with self.connect() as c:
-            result = c.execute("UPDATE sk_documents SET public=false,acl_verified_at=NULL,status='deleted' "
-                               "WHERE source_id=%s AND NOT(external_id=ANY(%s::text[])) AND status!='deleted'",
-                               (source_id, list(seen)))
-            return result.rowcount
+            rows = c.execute("UPDATE sk_documents SET public=false,acl_verified_at=NULL,status='deleted' "
+                             "WHERE source_id=%s AND NOT(external_id=ANY(%s::text[])) AND status!='deleted' RETURNING id",
+                             (source_id, list(seen))).fetchall()
+            for row in rows:
+                if self.permissions is not None:
+                    self.permissions.invalidate(c, row['id'])
+                self._enqueue_graph(c, row["id"])
+            return len(rows)
 
     def finish_scan(self, source_id: str, *, complete: bool, counts: dict) -> None:
         with self.connect() as c:
@@ -230,6 +274,9 @@ class PostgresStore:
                       "status=%s,counts=%s WHERE id=%s",
                       (complete and not counts.get("failed"), "ready" if complete and not counts.get("failed") else "partial",
                        Jsonb(counts), source_id))
+            if getattr(self, 'catalog_enabled', False):
+                c.execute('UPDATE sk_catalog_scopes SET complete=%s WHERE source_id=%s',
+                          (complete and not counts.get('failed'), source_id))
 
     def cached_embeddings(self, model_id: str, dimensions: int, hashes: Sequence[str]) -> dict[str, list[float]]:
         with self.connect() as c:
@@ -241,20 +288,30 @@ class PostgresStore:
 
     def publish(self, *, doc_id: str, node: SourceNode, chunks: Sequence[Chunk], embeddings: Sequence[Sequence[float]],
                 token_texts: Sequence[str], model_id: str, dimensions: int, pipeline_id: str,
-                raw_hash: str, content_hash: str, raw_path: str, warnings: Sequence[str]) -> str:
-        if not chunks or not (len(chunks) == len(embeddings) == len(token_texts)):
+                raw_hash: str, content_hash: str, raw_path: str, warnings: Sequence[str], _structure=None,
+                _catalog_entries=None, _catalog_revision=None, _tables=None, _index_batch=None,
+                _permission_revision=None, _visual_requests=None) -> str:
+        if (not chunks and not (_visual_requests and getattr(self,'visual_jobs',None))) or not (len(chunks) == len(embeddings) == len(token_texts)):
             raise ValueError("empty or mismatched document index")
         vectors = [vector_literal(values, dimensions) for values in embeddings]
+        if _index_batch is not None and (_index_batch.mode not in ('shadow', 'reuse')
+                or [list(p.tokens) for p in _index_batch.payloads] != [text.split() for text in token_texts]):
+            raise ValueError('invalid index publication batch')
         version_id = "ver-" + uuid.uuid4().hex
         with self.connect() as c:
             doc = c.execute("SELECT d.public,s.enabled FROM sk_documents d JOIN sk_sources s ON s.id=d.source_id "
                             "WHERE d.id=%s FOR UPDATE OF d", (doc_id,)).fetchone()
-            if not doc or not doc["public"] or not doc["enabled"]:
+            if not doc or not doc["enabled"] or (self.permissions is None and not doc["public"]):
                 raise AccessDenied("document was withdrawn before publication")
+            if self.permissions is not None:
+                self.permissions.require(c, doc_id, _permission_revision)
             c.execute("INSERT INTO sk_versions(id,document_id,raw_hash,content_hash,pipeline_id,model_id,dimensions,"
                       "source_revision,raw_path,warnings) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                       (version_id, doc_id, raw_hash, content_hash, pipeline_id, model_id, dimensions,
                        node.revision, raw_path, Jsonb(list(warnings))))
+            if self.history_enabled:
+                from .history.postgres import write_metadata
+                write_metadata(c, version_id, doc_id, node)
             for chunk, vector, tokens in zip(chunks, vectors, token_texts, strict=True):
                 c.execute("INSERT INTO sk_chunks(version_id,chunk_id,ordinal,text,heading,embedding_text,content_hash,locator,tokens,embedding) "
                           "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,to_tsvector('simple',%s),%s::vector)",
@@ -262,10 +319,33 @@ class PostgresStore:
                            chunk.content_hash, Jsonb(chunk.locator), tokens, vector))
                 c.execute("INSERT INTO sk_embedding_cache(model_id,dimensions,input_hash,embedding) VALUES(%s,%s,%s,%s::vector) "
                           "ON CONFLICT DO NOTHING", (model_id, dimensions, chunk.content_hash, vector))
-                self._index_terms(c, version_id, chunk.chunk_id, tokens.split())
+                if _index_batch is None or _index_batch.mode == 'shadow':
+                    self._index_terms(c, version_id, chunk.chunk_id, tokens.split())
+                else:
+                    c.execute('UPDATE sk_chunks SET token_count=%s WHERE version_id=%s AND chunk_id=%s',
+                              (len(tokens.split()), version_id, chunk.chunk_id))
+            if _index_batch is not None:
+                from .indexing.postgres import write_index
+                write_index(c, version_id, doc_id, chunks, _index_batch)
+            if _structure is not None:
+                from .context_store import write_structure
+                write_structure(c, version_id, _structure, chunks)
+            if _catalog_entries is not None:
+                from .catalog.postgres import write_catalog
+                write_catalog(c, version_id, doc_id, chunks, _catalog_entries, _catalog_revision)
+            if _tables is not None:
+                from .tables.postgres import write_tables
+                write_tables(c, version_id, _tables)
             c.execute("UPDATE sk_documents SET active_version=%s,source_revision=%s,status='ready',error_code=NULL WHERE id=%s",
                       (version_id, node.revision, doc_id))
+            self._enqueue_graph(c, doc_id)
+            if _visual_requests:
+                self.visual_jobs.enqueue(c,doc_id,version_id,_visual_requests)
         return version_id
+
+    def publish_structured(self, parsed, *, _write_context=True, _write_tables=False, **publication) -> str:
+        return self.publish(**publication, _structure=parsed if _write_context else None,
+                            _tables=parsed if _write_tables else None)
 
     @staticmethod
     def _index_terms(c, version_id: str, chunk_id: str, tokens: Sequence[str]) -> None:
@@ -298,12 +378,7 @@ class PostgresStore:
                 return migrated
 
     def _collections(self, principal: Principal, requested: Sequence[str] | None) -> list[str]:
-        if not principal.actor_id or not principal.company_id or not principal.product_id:
-            raise AccessDenied("authenticated principal required")
-        selected = list(principal.allowed_collections if requested is None else requested)
-        if not set(selected).issubset(principal.allowed_collections):
-            raise AccessDenied("collection not allowed")
-        return selected
+        return self.select_collections(principal, requested)
 
     def collections(self, principal: Principal) -> list[dict]:
         acl, args = self._collection_acl(principal, None)
@@ -325,12 +400,17 @@ class PostgresStore:
 
     def _acl(self, principal: Principal, requested: Sequence[str] | None) -> tuple[str, tuple]:
         acl, args = self._collection_acl(principal, requested)
+        if self.permissions is not None:
+            permission, parameters = self.permissions.acl(principal)
+            return (acl + " AND s.enabled AND d.status IN ('ready','stale') AND " + permission,
+                    (*args, *parameters))
         return (acl + " AND s.enabled=true AND d.public=true "
                 "AND d.status IN ('ready','stale') AND d.acl_verified_at >= %s",
                 (*args, datetime.now(timezone.utc) - timedelta(seconds=self.acl_ttl_seconds)))
 
     def retrieve(self, principal: Principal, requested: Sequence[str] | None, *, vector: Sequence[float],
                  model_id: str, dimensions: int, tokens: Sequence[str], limit: int = 40) -> tuple[list[SearchHit], list[SearchHit]]:
+        from .observability import stage
         if not 1 <= limit <= 100:
             raise ValueError("invalid candidate limit")
         acl, args = self._acl(principal, requested)
@@ -343,15 +423,19 @@ class PostgresStore:
         with self.connect() as c:
             # Same transaction snapshot for both channels; authorization is in each SQL query, never post-filtered.
             c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            from .indexing.postgres import require_compatible_index, EFFECTIVE_TERMS
+            require_compatible_index(self, c, principal=principal)
+            terms_relation = EFFECTIVE_TERMS if self.indexing_enabled else 'sk_chunk_terms'
             if c.execute("SELECT 1 FROM sk_chunks ch JOIN sk_versions v ON v.id=ch.version_id "
                          "JOIN sk_documents d ON d.active_version=v.id JOIN sk_sources s ON s.id=d.source_id "
                          "JOIN sk_collections k ON k.id=s.collection_id WHERE " + acl +
                          " AND ch.token_count IS NULL LIMIT 1", args).fetchone():
                 raise RuntimeError("bm25_index_migration_required")
-            dense = c.execute(base.format(score="1-(ch.embedding <=> %s::vector)", extra=""),
-                              (vector_literal(vector, dimensions), *args, model_id, dimensions, limit)).fetchall()
+            with stage('dense'):
+                dense = c.execute(base.format(score="1-(ch.embedding <=> %s::vector)", extra=""),
+                                  (vector_literal(vector, dimensions), *args, model_id, dimensions, limit)).fetchall()
             lexical: list[dict] = []
-            if tokens:
+            with stage('lexical'):
                 # N, df and average length are computed ONLY over authorized active
                 # chunks. Hidden documents cannot affect a user's BM25 scores.
                 lexical = c.execute("WITH eligible AS MATERIALIZED ("
@@ -360,10 +444,10 @@ class PostgresStore:
                     "JOIN sk_documents d ON d.id=v.document_id AND d.active_version=v.id "
                     "JOIN sk_sources s ON s.id=d.source_id JOIN sk_collections k ON k.id=s.collection_id "
                     "WHERE " + acl + " AND v.model_id=%s AND v.dimensions=%s AND ch.token_count IS NOT NULL), "
-                    "stats AS (SELECT count(*)::float8 AS n,avg(token_count)::float8 AS avgdl FROM eligible), "
-                    "matches AS MATERIALIZED (SELECT t.*,e.token_count FROM sk_chunk_terms t "
+                    "stats AS MATERIALIZED (SELECT count(*)::float8 AS n,avg(token_count)::float8 AS avgdl FROM eligible), "
+                    "matches AS MATERIALIZED (SELECT t.*,e.token_count FROM " + terms_relation + " t "
                     "JOIN eligible e USING(version_id,chunk_id) WHERE t.term=ANY(%s::text[])), "
-                    "df AS (SELECT term,count(*)::float8 AS n FROM matches GROUP BY term), "
+                    "df AS MATERIALIZED (SELECT term,count(*)::float8 AS n FROM matches GROUP BY term), "
                     "ranked AS (SELECT m.version_id,m.chunk_id,"
                     "sum(ln(1+(s.n-d.n+0.5)/(d.n+0.5))*m.tf*2.2/"
                     "(m.tf+1.2*(0.25+0.75*m.token_count/nullif(s.avgdl,0))))::float8 AS score "
@@ -374,7 +458,7 @@ class PostgresStore:
                     "FROM ranked r JOIN sk_chunks ch USING(version_id,chunk_id) "
                     "JOIN sk_versions v ON v.id=ch.version_id JOIN sk_documents d ON d.id=v.document_id "
                     "JOIN sk_sources s ON s.id=d.source_id ORDER BY r.score DESC,ch.chunk_id,v.id",
-                    (*args, model_id, dimensions, list(dict.fromkeys(tokens))[:100], limit)).fetchall()
+                    (*args, model_id, dimensions, list(dict.fromkeys(tokens))[:100], limit)).fetchall() if tokens else []
         return [SearchHit(**row) for row in dense], [SearchHit(**row) for row in lexical]
 
     def revalidate_hits(self, principal: Principal, hits: Sequence[SearchHit]) -> list[SearchHit]:
@@ -405,6 +489,9 @@ class PostgresStore:
                                  "ORDER BY ordinal OFFSET %s LIMIT %s", (version_id, offset, limit + 1)).fetchall()
         more = len(sections) > limit
         sections = sections[:limit]
+        from .context_store import require_document
+        with self.connect() as c:
+            require_document(self, c, principal, doc_id, version_id)
         return {"document_id": doc_id, "version_id": version_id, "collection_id": doc["collection_id"],
                 "title": doc["title"], "source_url": doc["source_url"], "stale": doc["status"] == "stale",
                 "warnings": doc["warnings"], "sections": sections,

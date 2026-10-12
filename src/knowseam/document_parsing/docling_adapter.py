@@ -12,7 +12,8 @@ class DoclingAdapter(DocumentParser):
     def __init__(self, client, options):
         self.client, self.options = client, options
         self.identity = client.status()
-        self.version = parser_fingerprint(self.identity, options, normalizer_version=NORMALIZER_VERSION)
+        self.version = parser_fingerprint(
+            self.identity, options, normalizer_version=self.identity.normalizer_version)
 
     def parse(self, content):
         # A restarted parser must not publish new output under an old pipeline ID.

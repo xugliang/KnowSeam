@@ -1,7 +1,7 @@
 """Normalize actual Docling items, without flattening Markdown or generating facts."""
 from ..domain import ParsedDocument, Section, UnsupportedDocument
 from .extensions.cleanup import clean_text
-from .extensions.tables import table_sections
+from .extensions.tables import table_sections, structured_table
 
 import hashlib
 from pathlib import Path
@@ -10,8 +10,9 @@ from pathlib import Path
 # a maintainer remembering to bump a literal version or on .git in the image.
 _ROOT = Path(__file__).parent
 _FILES = ('normalizer.py', 'docling_adapter.py', 'extensions/tables.py', 'extensions/cleanup.py')
-NORMALIZER_VERSION = 'docling-structure-v1-' + hashlib.sha256(
-    b''.join(name.encode() + b'\0' + (_ROOT / name).read_bytes() for name in _FILES)).hexdigest()
+NORMALIZER_VERSION = 'docling-structure-v2-' + hashlib.sha256(
+    b''.join(name.encode() + b'\0' + (_ROOT / name).read_bytes() for name in _FILES)
+    + (_ROOT.parent / 'tables/domain.py').read_bytes()).hexdigest()
 
 
 def office_context(document, item, locator):
@@ -34,7 +35,7 @@ def office_context(document, item, locator):
 
 def normalize_document(document: object, *, parser_version: str, max_sections: int,
                        max_text_chars: int) -> ParsedDocument:
-    sections, warnings = [], []
+    sections, warnings, tables = [], [], []
     heading = ''
     headings = []
     chars = 0
@@ -57,7 +58,11 @@ def normalize_document(document: object, *, parser_version: str, max_sections: i
                     for name, value in (('row_start', bbox.t), ('column_start', bbox.l)):
                         if value >= 0 and float(value).is_integer():
                             locator[name] = int(value) + 1
-            entries = table_sections(item, locator, heading)
+            table = structured_table(item, locator, f't-{len(tables)+1}')
+            tables.append(table)
+            if len(tables) > 1000 or sum(len(t.cells) for t in tables) > 200000:
+                raise UnsupportedDocument('parser_table_structure_limit')
+            entries = table_sections(item, {**locator, 'table_id': table.table_id}, heading)
         else:
             text = clean_text(getattr(item, 'text', ''))
             if label in ('section_header', 'title') and text:
@@ -76,4 +81,4 @@ def normalize_document(document: object, *, parser_version: str, max_sections: i
             sections.append(section)
     if not sections:
         raise UnsupportedDocument('parser_no_searchable_text')
-    return ParsedDocument(tuple(sections), tuple(dict.fromkeys(warnings)), parser_version)
+    return ParsedDocument(tuple(sections), tuple(dict.fromkeys(warnings)), parser_version, tuple(tables), (), 2)

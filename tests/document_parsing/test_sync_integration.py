@@ -23,9 +23,10 @@ async def test_cli_sync_uses_parser_factory(monkeypatch, settings, runtime):
     calls = []
     from knowseam.document_parsing import factory
     original = factory.build_parser
-    def build(config, *, max_bytes, client=None):
+    def build(config, *, max_bytes, client=None, structured_tables=False):
         calls.append((config, client))
-        return original(config, max_bytes=max_bytes, client=client)
+        assert structured_tables is False
+        return original(config, max_bytes=max_bytes, client=client, structured_tables=structured_tables)
     monkeypatch.setattr(factory, 'build_parser', build)
     class Connector:
         async def close(self):

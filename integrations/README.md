@@ -1,6 +1,12 @@
 # 智能体接入
 
-客户端共用一个服务端知识库。MCP 只暴露 `knowledge_list`、`knowledge_search`、`knowledge_read`；没有 SQL、写文件、同步、发题或抄送工具。
+客户端共用一个服务端知识库。MCP 默认暴露 `knowledge_list`、`knowledge_search`、`knowledge_read`；没有 SQL、写文件、同步、发题或抄送工具。
+
+管理员可在网关、stdio 桥接或 `KnowledgePluginConfig` 中显式设置 `extended_tools=true`，
+注册目录、上下文、表格、历史、视觉搜索和能力查询工具。核心服务的相应 features 也须启用。
+图片使用受控 MCP resource；支持能力不等于所有客户端均能渲染图片。
+扩展仍只读，身份与集合范围不能由模型提升；参数、HTTP 对应关系见
+[检索契约](../docs/RETRIEVAL-CONTRACT.md)，验收边界见 [验证状态](../docs/VALIDATION-THREE-PHASES.md)。
 
 ## 管理员
 
@@ -45,7 +51,7 @@ args = ["-m", "knowseam.bridge", "--config", "/absolute/private/knowseam-client.
 
 优先使用底座已有 MCP 接入，无需改框架。原生工具方式可显式导入 `knowseam.harness_plugin`，通过 `KnowledgePluginConfig` 和 `install_knowledge_tools(context, config)` 注册，底座需授予 `knowledge.read`。原生适配器身份来自已验证的执行作用域，服务令牌仅给可信产品后端。
 
-本次不自动修改 A。旧 `suite_knowledge` 继续运行；后续更换产品导入路径时单独验收。不要覆盖旧部署目录。
+本轮不修改产品 A/B 代码或部署。现有已部署接口保持不变；产品显式启用新工具时单独做调用方验收，不覆盖产品业务配置。
 
 ## 协议依据与验收范围
 

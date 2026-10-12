@@ -10,6 +10,7 @@ from .protocol import (HEADER, MAX_BYTES, MAX_RESPONSE_BYTES, DoclingOptions, Pa
 class ParserClient:
     def __init__(self, socket_path: Path, *, timeout_seconds: int = 120, max_bytes: int = MAX_BYTES):
         self.max_bytes = min(max_bytes, MAX_BYTES)
+        self.protocol_version = None
         self.client = httpx.Client(transport=httpx.HTTPTransport(uds=str(socket_path), retries=0),
                                    base_url='http://parser', timeout=timeout_seconds + 5,
                                    follow_redirects=False, trust_env=False)
@@ -30,7 +31,19 @@ class ParserClient:
 
     def status(self) -> ParserIdentity:
         try:
-            return ParserIdentity.model_validate(load_json(self._request('GET', '/v1/status', limit=8192)))
+            try:
+                body = self._request('GET', '/v2/status', limit=8192)
+                version = 2
+            except UnsupportedDocument as error:
+                if str(error) != 'parser_http_404':
+                    raise
+                body = self._request('GET', '/v1/status', limit=8192)
+                version = 1
+            identity = ParserIdentity.model_validate(load_json(body))
+            if identity.protocol_version != version:
+                raise ValueError('unexpected negotiated protocol')
+            self.protocol_version = version
+            return identity
         except (ValueError, TypeError):
             raise UnsupportedDocument('parser_identity_invalid') from None
 
@@ -38,9 +51,11 @@ class ParserClient:
         if len(content.data) > self.max_bytes:
             raise UnsupportedDocument('parser_input_limit')
         metadata = ParseMetadata(filename=content.filename, media_type=content.media_type, options=options)
-        body = self._request('POST', '/v1/parse', limit=MAX_RESPONSE_BYTES, content=content.data,
+        if self.protocol_version is None:
+            self.status()
+        body = self._request('POST', f'/v{self.protocol_version}/parse', limit=MAX_RESPONSE_BYTES, content=content.data,
                              headers={HEADER: encode_metadata(metadata)})
-        return decode_document(body, max_sections=options.max_sections)
+        return decode_document(body, max_sections=options.max_sections, protocol_version=self.protocol_version)
 
     def close(self):
         self.client.close()

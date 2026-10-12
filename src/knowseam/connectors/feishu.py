@@ -22,9 +22,10 @@ import httpx
 from ..domain import (AccessDenied, IncompleteSnapshot, KnowledgeError, NotFound,
                       SourceConnector, SourceContent, SourceNode, SourceSnapshot, UnsupportedDocument)
 from ..parsers import FEISHU_NATIVE_TYPE
+from ..permissions.domain import PermissionConnector, PermissionSnapshot, public_snapshot
 
 
-class FeishuWikiConnector(SourceConnector):
+class FeishuWikiConnector(SourceConnector, PermissionConnector):
     API_ORIGIN = "https://open.feishu.cn"
     PUBLIC_LINKS = frozenset({"tenant_readable", "tenant_editable"})
 
@@ -215,6 +216,25 @@ class FeishuWikiConnector(SourceConnector):
             raise AccessDenied("current company-wide access cannot be verified") from exc
         if public is not True:
             raise AccessDenied("source is no longer verified company-wide")
+
+    async def fetch_permissions(self, external_ids):
+        values = []
+        for external_id in external_ids:
+            try:
+                kind, token = external_id.split(':', 1)
+                self._check_token(token)
+                if kind not in {'docx', 'sheet', 'file'} or external_id in self.excluded_objects:
+                    values.append(PermissionSnapshot(external_id=external_id, reason='unsupported'))
+                    continue
+                public = await self._public(token, kind)
+                if public is False:
+                    # Direct members do not prove a complete Wiki inheritance chain.
+                    values.append(PermissionSnapshot(external_id=external_id, reason='unsupported'))
+                else:
+                    values.append(public_snapshot(external_id, public))
+            except (KnowledgeError, ValueError):
+                values.append(PermissionSnapshot(external_id=external_id, reason='unavailable'))
+        return tuple(values)
 
     async def _verify_source_revision(self, node):
         try:

@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 from ..domain import ParsedDocument, SourceContent, UnsupportedDocument
-from .protocol import MAX_RESPONSE_BYTES, DoclingOptions, ParseMetadata, decode_document, encode_metadata
+from .protocol import MAX_RESPONSE_BYTES, DoclingOptions, ParseMetadata, ParseMetadataV2, decode_document, encode_metadata
 
 
 class ParseRunner(ABC):
@@ -24,7 +24,13 @@ class ProcessRunner(ParseRunner):
                                    '--child', str(model_path))
 
     def run(self, content, options):
-        metadata = ParseMetadata(filename=content.filename, media_type=content.media_type, options=options)
+        return self.run_versioned(content, options, 1)
+
+    def run_versioned(self, content, options, protocol_version):
+        if protocol_version not in (1, 2):
+            raise UnsupportedDocument('parser_protocol_unsupported')
+        model = ParseMetadataV2 if protocol_version == 2 else ParseMetadata
+        metadata = model(filename=content.filename, media_type=content.media_type, options=options)
         environment = {'PATH': os.defpath, 'LANG': 'C.UTF-8', 'HOME': '/tmp',
                        'PYTHONPATH': str(Path(__file__).resolve().parents[2]),
                        'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
@@ -51,20 +57,22 @@ class ProcessRunner(ParseRunner):
             body = output_file.read(self.max_response_bytes + 1)
             if len(body) > self.max_response_bytes:
                 raise UnsupportedDocument('parser_response_limit')
-            return decode_document(body, max_sections=options.max_sections)
+            return decode_document(body, max_sections=options.max_sections, protocol_version=protocol_version)
 
 
 def child(model_path):
     from .docling_adapter import DoclingDocumentParser
     from .executor import load_identity
     from .protocol import MAX_BYTES, decode_metadata, encode_document
-    metadata = decode_metadata(sys.stdin.buffer.readline(8194).decode().strip())
+    metadata = decode_metadata(sys.stdin.buffer.readline(8194).decode().strip(), allow_v2=True)
+    protocol_version = getattr(metadata, 'protocol_version', 1)
     body = sys.stdin.buffer.read(MAX_BYTES + 1)
     if len(body) > MAX_BYTES:
         raise UnsupportedDocument('parser_input_limit')
-    parser = DoclingDocumentParser(Path(model_path), load_identity(Path(model_path)))
+    identity = load_identity(Path(model_path)).model_copy(update={'protocol_version': protocol_version})
+    parser = DoclingDocumentParser(Path(model_path), identity)
     result = parser.parse_with_options(SourceContent(body, metadata.filename, metadata.media_type), metadata.options)
-    sys.stdout.buffer.write(encode_document(result))
+    sys.stdout.buffer.write(encode_document(result, protocol_version=protocol_version))
 
 
 if __name__ == '__main__':

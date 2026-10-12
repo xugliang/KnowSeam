@@ -39,6 +39,7 @@ class KnowledgeToolError(RuntimeError):
 @dataclass(frozen=True)
 class KnowledgePluginConfig:
     enabled: bool = False
+    extended_tools: bool = False
     base_url: str = ""
     service_token: str = field(default="", repr=False)
     company_by_tenant: Mapping[str, str] = field(default_factory=dict)
@@ -48,7 +49,7 @@ class KnowledgePluginConfig:
     max_response_bytes: int = 512 * 1024
 
     def __post_init__(self) -> None:
-        for flag in (self.enabled, self.company_equals_tenant, self.allow_insecure_http):
+        for flag in (self.enabled, self.extended_tools, self.company_equals_tenant, self.allow_insecure_http):
             if not isinstance(flag, bool):
                 raise ValueError("knowledge plugin flags must be booleans")
         mapping = dict(self.company_by_tenant)
@@ -98,7 +99,7 @@ class KnowledgePluginConfig:
             raise ValueError("an explicit trusted tenant/company mapping is required")
 
 
-def knowledge_tool_specs() -> tuple[ToolSpec, ...]:
+def knowledge_tool_specs(*, extended: bool = False) -> tuple[ToolSpec, ...]:
     """Return fresh specs; callers cannot mutate a shared schema instance."""
 
     def spec(name: str, description: str, properties: dict, required: tuple[str, ...] = ()) -> ToolSpec:
@@ -113,7 +114,7 @@ def knowledge_tool_specs() -> tuple[ToolSpec, ...]:
             },
         )
 
-    return (
+    legacy = (
         spec("knowledge.list", "列出当前用户在当前产品中有权限查询的知识集合。", {}),
         spec("knowledge.search", "检索知识集合，保留来源链接、文档版本和原文定位供回答引用。", {
             "query": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": r"\S"},
@@ -131,6 +132,30 @@ def knowledge_tool_specs() -> tuple[ToolSpec, ...]:
                       "description": "单页最多返回的 chunk 数，非文档数或字符数；上限100。"},
         }, ("document_id", "version_id")),
     )
+    if not extended:
+        return legacy
+    from .coverage import SearchOptions
+    search_schema = dict(legacy[1].input_schema)
+    search_schema['properties'] = {**search_schema['properties'], **SearchOptions.model_json_schema()['properties']}
+    legacy = (legacy[0], legacy[1].model_copy(update={'input_schema': search_schema}, deep=True), legacy[2])
+    from .contracts import ContextRequest
+    from .catalog.domain import CatalogRequest
+    from .tables.contracts import TableListRequest, TableReadRequest
+    from .history.domain import HistorySearchRequest, HistoryReadRequest
+    from .visual.domain import VisualSearchRequest
+    optional = [spec('knowledge.capabilities', '查询当前身份可用的可选知识读取能力。', {})]
+    for name, description, model in (
+        ('knowledge.context', '按检索结果的文档、版本、块编号读取邻块或原始父节；不要猜测编号。', ContextRequest),
+        ('knowledge.catalog', '按已登记种类枚举授权目录，回答有哪些时使用；分页到结束不代表真实世界穷尽。', CatalogRequest),
+        ('knowledge.table_list', '列出当前文档版本的结构表格；使用检索得到的文档版本，不猜编号。', TableListRequest),
+        ('knowledge.table_read', '读取指定表格的行列窗口，保留原始值、单位、公式缓存状态和合并主格；不执行公式。', TableReadRequest),
+        ('knowledge.history_search', '按事实有效时间检索历史证据；known_as_of限定当时已知内容，当前权限始终生效。', HistorySearchRequest),
+        ('knowledge.history_read', '读取检索得到的历史版本，沿用known_as_of；不读取之后才接受的内容。', HistoryReadRequest),
+        ('knowledge.visual_search', '检索授权图片/页面并返回定位和认证资源URI；客户端不支持图像资源时明确告知，不能猜测内容或转为公开链接。', VisualSearchRequest),
+    ):
+        schema = model.model_json_schema()
+        optional.append(spec(name, description, {}).model_copy(update={'input_schema': schema}, deep=True))
+    return legacy + tuple(optional)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -250,10 +275,58 @@ class KnowledgeTool:
             raise KnowledgeToolError("knowledge tool context mismatch")
         if self.spec.name == "knowledge.list":
             return await self.client.request(context, "GET", "v1/collections")
+        if self.spec.name == 'knowledge.capabilities':
+            return await self.client.request(context, 'GET', 'v1/capabilities')
+        if self.spec.name == 'knowledge.visual_search':
+            value = await self.client.request(context, 'POST', 'v1/visual/search', payload=arguments)
+            if 'error' not in value and (not isinstance(value.get('hits'), list) or any(
+                not isinstance(hit, dict) or hit.get('modality') != 'visual' or
+                ('collection_ids' in arguments and arguments['collection_ids'] is not None
+                 and hit.get('collection_id') not in arguments['collection_ids'])
+                for hit in value['hits']
+            )):
+                raise KnowledgeToolError('knowledge visual response contract mismatch')
+            return value
+        if self.spec.name in {'knowledge.history_search','knowledge.history_read'}:
+            operation = self.spec.name.removeprefix('knowledge.history_')
+            value = await self.client.request(context, 'POST', 'v1/history/'+operation, payload=arguments)
+            if 'error' not in value:
+                if operation == 'read' and (value.get('document_id') != arguments['document_id']
+                    or value.get('version_id') != arguments['version_id'] or not isinstance(value.get('sections'), list)):
+                    raise KnowledgeToolError('knowledge history response contract mismatch')
+                if operation == 'search' and not isinstance(value.get('observations'), list):
+                    raise KnowledgeToolError('knowledge history response contract mismatch')
+            return value
+        if self.spec.name in {'knowledge.table_list', 'knowledge.table_read'}:
+            payload = dict(arguments)
+            document = payload.pop('document_id')
+            table = payload.pop('table_id', None)
+            path = f'v1/documents/{document}/tables'
+            if table is None:
+                value = await self.client.request(context, 'GET', path, params=payload)
+            else:
+                value = await self.client.request(context, 'POST', path + f'/{table}/read', payload=payload)
+            if 'error' not in value and (value.get('document_id') != document or value.get('version_id') != payload['version_id']
+                or not isinstance(value.get('tables' if table is None else 'cells'), list)
+                or (table is not None and value.get('table_id') != table)):
+                raise KnowledgeToolError('knowledge table response contract mismatch')
+            return value
+        if self.spec.name in {'knowledge.context', 'knowledge.catalog'}:
+            value = await self.client.request(context, 'POST', 'v1/' + self.spec.name.split('.')[1], payload=arguments)
+            if self.spec.name == 'knowledge.context' and 'error' not in value:
+                if (value.get('document_id') != arguments['document_id'] or value.get('version_id') != arguments['version_id']
+                        or not isinstance(value.get('ranges'), list) or not isinstance(value.get('citations'), list)):
+                    raise KnowledgeToolError('knowledge context response contract mismatch')
+            if self.spec.name == 'knowledge.catalog' and 'error' not in value:
+                if (not isinstance(value.get('items'), list) or any(not isinstance(item, dict)
+                    or item.get('collection_id') not in arguments['collection_ids'] for item in value['items'])):
+                    raise KnowledgeToolError('knowledge catalog response contract mismatch')
+            return value
         if self.spec.name == "knowledge.search":
             return await self.client.request(context, "POST", "v1/search", payload={
                 "query": arguments["query"], "collection_ids": arguments["collection_ids"],
                 "limit": arguments.get("limit", 8),
+                **{k: arguments[k] for k in ('strategy', 'filters', 'include_diagnostics', 'include_paths') if k in arguments},
             })
         if self.spec.name == "knowledge.read":
             value = await self.client.request(context, "GET", "v1/documents/" + arguments["document_id"], params={
@@ -282,7 +355,7 @@ async def register_knowledge_tools(
     try:
         client = KnowledgeHttpClient(config, product_path, transport=transport)
         owned.callback("knowledge-http-client", client.close)
-        for spec in knowledge_tool_specs():
+        for spec in knowledge_tool_specs(extended=config.extended_tools):
             registry.register_owned(product_path, owned, spec, KnowledgeTool(client, spec))
         return client
     except BaseException:
@@ -304,7 +377,7 @@ async def install_knowledge_tools(
     client = KnowledgeHttpClient(config, context.path, transport=transport)
     try:
         context.own("knowseam-http-client", client.close)
-        for spec in knowledge_tool_specs():
+        for spec in knowledge_tool_specs(extended=config.extended_tools):
             context.register_tool(spec, KnowledgeTool(client, spec))
         return client
     except BaseException:

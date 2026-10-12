@@ -1,0 +1,23 @@
+{
+  "manifest": {
+    "principal_ref": "public-fixture-reader", "snapshot_ref": "synthetic-v2",
+    "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "actor_id": "fixture-actor", "company_id": "fixture-company", "product_id": "fixture-product",
+    "collection_ids": ["fixture-public"], "index_revision": "fixture-index-v2",
+    "embedding_identity": "contract-only-embedding", "reranker_identity": "contract-only-reranker",
+    "tokenizer_fingerprint": "contract-only-tokenizer", "candidate_limit": 40, "k": 8,
+    "quality_claim": "contract_only"
+  },
+  "cases": [
+    {"query":"示例设备是否支持导出？","case_type":"fact","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]}]},
+    {"query":"示例系列有哪些组件？","case_type":"enumeration","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1","d2"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]},{"alternatives":[{"document_id":"d2","version_id":"v2","section_id":"s-0","start_char":0,"end_char":8}]}]},
+    {"query":"申请流程和例外条件分别是什么？","case_type":"cross_section","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]},{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-1","start_char":0,"end_char":8}]}]},
+    {"query":"两个示例方案有何不同？","case_type":"multi_document","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1","d2"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]},{"alternatives":[{"document_id":"d2","version_id":"v2","section_id":"s-0","start_char":0,"end_char":8}]}]},
+    {"query":"两份制度的有效时间是否冲突？","case_type":"conflict","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1","d2"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]},{"alternatives":[{"document_id":"d2","version_id":"v2","section_id":"s-0","start_char":0,"end_char":8}]}]},
+    {"query":"不存在的服务是否免费？","case_type":"noanswer","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":[],"required_evidence_groups":[]},
+    {"query":"示例企业词的别名是什么？","case_type":"terminology","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v1","section_id":"s-0","start_char":0,"end_char":8}]}]},
+    {"query":"示例表格第2行价格和单位是什么？","case_type":"table","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d3"],"required_evidence_groups":[{"alternatives":[{"document_id":"d3","version_id":"v3","table_id":"t1","row":2,"column_id":"price","expected_value":"123.45","unit":"元"}]}]},
+    {"query":"已撤权的测试制度？","case_type":"permission","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":[],"required_evidence_groups":[]},
+    {"query":"更新后的示例条款是什么？","case_type":"incremental","principal_ref":"public-fixture-reader","snapshot_ref":"synthetic-v2","expected_document_ids":["d1"],"required_evidence_groups":[{"alternatives":[{"document_id":"d1","version_id":"v2","section_id":"s-0","start_char":0,"end_char":8}]}]}
+  ]
+}

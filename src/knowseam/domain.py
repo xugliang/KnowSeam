@@ -75,6 +75,16 @@ class ParsedDocument:
     sections: tuple[Section, ...]
     warnings: tuple[str, ...] = ()
     parser_version: str = "structured-v1"
+    tables: tuple = ()
+    assets: tuple = ()
+    structure_version: int = 1
+
+
+@dataclass(frozen=True)
+class ChunkSpan:
+    section_id: str
+    start_char: int
+    end_char: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,7 @@ class Chunk:
     locator: dict[str, Any]
     ordinal: int
     heading: str = ""
+    spans: tuple[ChunkSpan, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,7 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 
@@ -18,7 +18,7 @@ MAX_RESPONSE_BYTES = 150 * 1024 * 1024
 
 
 class ParserIdentity(StrictModel):
-    protocol_version: Annotated[int, Field(strict=True, ge=1, le=1)] = 1
+    protocol_version: Annotated[int, Field(strict=True, ge=1, le=2)] = 1
     upstream_sha: Annotated[str, Field(strict=True, pattern=r'^[0-9a-f]{40}$')]
     runtime_source_sha256: Hash
     dependency_fingerprint: Hash
@@ -48,6 +48,10 @@ class ParseMetadata(StrictModel):
         return value
 
 
+class ParseMetadataV2(ParseMetadata):
+    protocol_version: Literal[2] = 2
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -70,14 +74,22 @@ def encode_metadata(metadata: ParseMetadata) -> str:
     return value
 
 
-def decode_metadata(header: str, *, max_bytes=8192) -> ParseMetadata:
+def decode_metadata(header: str, *, max_bytes=8192, allow_v2=False) -> ParseMetadata:
     if len(header) > max_bytes:
         raise ValueError('metadata limit')
-    return ParseMetadata.model_validate(load_json(base64.b64decode(header, validate=True).decode('utf-8')))
+    value = load_json(base64.b64decode(header, validate=True).decode('utf-8'))
+    model = ParseMetadataV2 if allow_v2 and 'protocol_version' in value else ParseMetadata
+    return model.model_validate(value)
 
 
-def encode_document(document: ParsedDocument) -> bytes:
-    return json.dumps(asdict(document), ensure_ascii=False, allow_nan=False).encode('utf-8')
+def encode_document(document: ParsedDocument, *, protocol_version=1) -> bytes:
+    if protocol_version not in (1, 2):
+        raise UnsupportedDocument('parser_protocol_unsupported')
+    value = {'sections': [asdict(s) for s in document.sections], 'warnings': document.warnings,
+             'parser_version': document.parser_version}
+    if protocol_version == 2:
+        value.update(tables=[t.model_dump(mode='json') for t in document.tables], assets=list(document.assets))
+    return json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')
 
 
 def _locator(value, depth=0):
@@ -94,12 +106,16 @@ def _locator(value, depth=0):
     raise ValueError('invalid locator')
 
 
-def decode_document(body: bytes, *, max_sections=50000, max_text_chars=MAX_RESPONSE_BYTES) -> ParsedDocument:
+def decode_document(body: bytes, *, max_sections=50000, max_text_chars=MAX_RESPONSE_BYTES, protocol_version=1, allow_assets=False) -> ParsedDocument:
     try:
         values = load_json(body)
-        if set(values) != {'sections', 'warnings', 'parser_version'}:
+        if protocol_version not in (1, 2) or len(body) > MAX_RESPONSE_BYTES:
+            raise ValueError('protocol or response limit')
+        expected = {'sections', 'warnings', 'parser_version'} | ({'tables', 'assets'} if protocol_version == 2 else set())
+        if set(values) != expected:
             raise ValueError('unexpected response fields')
-        if not isinstance(values['sections'], list) or not 1 <= len(values['sections']) <= max_sections:
+        minimum = 0 if protocol_version==2 and allow_assets and values.get('assets') else 1
+        if not isinstance(values['sections'], list) or not minimum <= len(values['sections']) <= max_sections:
             raise ValueError('empty or oversized sections')
         sections = []
         total = 0
@@ -117,6 +133,20 @@ def decode_document(body: bytes, *, max_sections=50000, max_text_chars=MAX_RESPO
                 or any(not isinstance(w, str) or len(w) > 4096 for w in values['warnings'])
                 or not isinstance(values['parser_version'], str) or not 1 <= len(values['parser_version']) <= 512):
             raise ValueError('invalid response metadata')
-        return ParsedDocument(tuple(sections), tuple(values['warnings']), values['parser_version'])
+        tables, assets = (), ()
+        if protocol_version == 2:
+            from ..tables.domain import validate_tables
+            if not isinstance(values['tables'], list) or not isinstance(values['assets'], list):
+                raise ValueError('invalid structure arrays')
+            tables = validate_tables(values['tables'])
+            # Asset manifests get a separate authenticated transfer contract; paths are never accepted.
+            if values['assets']:
+                if not allow_assets or len(values['assets'])>500:
+                    raise ValueError('asset capability not negotiated')
+                from ..visual.domain import AssetRequest
+                assets = tuple(AssetRequest.model_validate(a).model_dump(mode='json') for a in values['assets'])
+            for table in tables:
+                _locator(table.locator)
+        return ParsedDocument(tuple(sections), tuple(values['warnings']), values['parser_version'], tables, assets, protocol_version)
     except (ValueError, TypeError, KeyError, RecursionError, UnicodeError):
         raise UnsupportedDocument('parser_invalid_output') from None

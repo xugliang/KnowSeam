@@ -15,8 +15,12 @@
 !deployment/
 !deployment/Dockerfile*
 !deployment/requirements-parser.lock
+!deployment/requirements-visual.lock
 !scripts/
 !scripts/vendor_identity.py
 !.build-parser/
 !.build-parser/wheelhouse/
 !.build-parser/wheelhouse/*.whl
+!.build-visual/
+!.build-visual/wheelhouse/
+!.build-visual/wheelhouse/*.whl

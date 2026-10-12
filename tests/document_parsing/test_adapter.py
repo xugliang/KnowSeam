@@ -15,9 +15,8 @@ def test_restart_identity_change_never_publishes_old_pipeline():
         def parse(self, content, options):
             self.calls += 1
             from knowseam.document_parsing.fingerprint import parser_fingerprint
-            from knowseam.document_parsing.normalizer import NORMALIZER_VERSION
             return ParsedDocument((Section('ok'),), parser_version=parser_fingerprint(
-                self.identity, options, normalizer_version=NORMALIZER_VERSION))
+                self.identity, options, normalizer_version=self.identity.normalizer_version))
     client = Client()
     parser = DoclingAdapter(client, DoclingOptions())
     assert parser.parse(SourceContent(b'x', 'a.txt', 'text/plain')).sections[0].text == 'ok'

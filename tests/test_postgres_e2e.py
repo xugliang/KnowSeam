@@ -191,7 +191,14 @@ def case(checked_dsn, tokenizer, tmp_path):
                  SyncWorker(store, parser, embedder, tokenizer, tmp_path / "archive"),
                  KnowledgeService(store, embedder, reranker, tokenizer), root)
     value.configure()
-    return value
+    try:
+        yield value
+    finally:
+        # Imported session fixtures can run again in another module. Preserve
+        # each case's records for debugging, but do not leave its sources live:
+        # a reuse-mode case would correctly make a later legacy health check
+        # fail. This changes only this random test company's configuration.
+        store.configure(company_id=company, collections=[], sources=[])
 
 
 def test_real_sync_retrieve_rerank_read_preserves_citations_and_pg_lexical(case):

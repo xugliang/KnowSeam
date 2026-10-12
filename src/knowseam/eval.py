@@ -12,6 +12,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -69,7 +70,7 @@ Retriever = Callable[[Any, Principal, EvaluationCase, int], Awaitable[Any]]
 
 
 async def _default_retriever(service: Any, principal: Principal, case: EvaluationCase, k: int) -> Any:
-    return await service.search(principal, case.query, collection_ids=case.collection_ids, limit=k)
+    return await service.search(principal, case.query, collection_ids=case.collection_ids or None, limit=k)
 
 
 def _result_ids(result: Any, principal: Principal, case: EvaluationCase, k: int) -> list[str]:
@@ -109,6 +110,7 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 
 
 def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    from .evaluation.metrics import aggregate_evidence
     answerable = [row for row in rows if row["expected_count"] > 0]
     noanswer = [row for row in rows if row["expected_count"] == 0]
     evaluated_noanswer = [row for row in noanswer if row["status"] == "ok"]
@@ -116,6 +118,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     # Failed answerable requests count as zero recall/RR; failures must not make
     # a weak deployment look better by silently removing its difficult queries.
     return {
+        **aggregate_evidence(rows),
         "cases": len(rows),
         "answerable_cases": len(answerable),
         "noanswer_cases": len(noanswer),
@@ -150,6 +153,8 @@ async def evaluate(
         raise EvaluationError("a trusted Principal is required")
     if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= 100:
         raise EvaluationError("k must be an integer between 1 and 100")
+    if retrievers is None and k > 20:
+        raise EvaluationError("deployed retrieval supports k <= 20; larger k requires explicit offline retrievers")
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout) or not 0 < timeout <= 600):
         raise EvaluationError("timeout must be in (0, 600] seconds")
@@ -162,13 +167,19 @@ async def evaluate(
         if isinstance(value, EvaluationCase):
             case = value
         elif isinstance(value, Mapping):
-            case = EvaluationCase.from_mapping(value)
+            if "required_evidence_groups" in value or "case_type" in value:
+                from .evaluation.cases import EvaluationCaseV2
+                case = EvaluationCaseV2.from_mapping(value)
+            else:
+                case = EvaluationCase.from_mapping(value)
         else:
             raise EvaluationError("invalid evaluation case")
         if not set(case.collection_ids).issubset(principal.allowed_collections):
             raise AccessDenied("evaluation requests an unauthorized collection")
         parsed.append(case)
     configured = {"deployed": _default_retriever} if retrievers is None else dict(retrievers)
+    if 'deployed' in configured and k > 20:
+        raise EvaluationError('deployed retrieval supports k <= 20')
     if not configured or set(configured) - MODES or not all(callable(value) for value in configured.values()):
         raise EvaluationError("retrievers must map dense/hybrid/reranked/deployed to async callbacks")
 
@@ -179,6 +190,7 @@ async def evaluate(
             started = time.perf_counter()
             error_code = None
             ids: list[str] = []
+            raw = []
             try:
                 raw = await asyncio.wait_for(callback(service, principal, case, k), timeout=timeout)
                 ids = _result_ids(raw, principal, case, k)
@@ -198,7 +210,9 @@ async def evaluate(
             expected = set(case.expected_document_ids)
             matched = len(expected.intersection(ids))
             first_rank = next((rank for rank, doc_id in enumerate(ids, 1) if doc_id in expected), None)
+            from .evaluation.metrics import evidence_counts
             rows.append({
+                **evidence_counts(case, raw, k, failed=error_code is not None),
                 "case_index": index,
                 "status": "error" if error_code else "ok",
                 "error_code": error_code,
@@ -257,10 +271,22 @@ def _sanitized_report(report: Mapping[str, Any]) -> dict[str, Any]:
                     raise EvaluationError("report statistics must be finite nonnegative numbers")
                 else:
                     clean[field] = value
+            for field in ("evidence_group_count", "matched_evidence_groups"):
+                value = row.get(field)
+                if value is not None and (type(value) is not int or not 0 <= value <= 100):
+                    raise EvaluationError("invalid evidence count")
+                clean[field] = value
+            total, matched = clean["evidence_group_count"], clean["matched_evidence_groups"]
+            if (total is None) != (matched is None) or (total is not None and matched > total):
+                raise EvaluationError("inconsistent evidence counts")
             rows.append(clean)
         # Recompute the aggregation; free-form caller-supplied metrics are not saved.
         cleaned_modes[mode] = {"metrics": _metrics(rows), "cases": rows}
+    checksum = report.get('manifest_checksum')
+    extra = {'manifest_checksum': checksum, 'snapshot_verified': False} if (
+        isinstance(checksum, str) and re.fullmatch(r'[a-f0-9]{64}', checksum)) else {}
     return {
+        **extra,
         "schema_version": SCHEMA_VERSION,
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "run_kind": report["run_kind"],

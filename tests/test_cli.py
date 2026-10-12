@@ -86,6 +86,18 @@ class Model:
         self.events.append(("close-model", self.model_id))
 
 
+@async_test
+async def test_index_rollback_is_explicit_and_never_loads_models(settings, runtime, monkeypatch, capsys):
+    import knowseam.indexing.postgres as indexing
+    calls = []
+    monkeypatch.setattr(indexing, 'materialize_legacy', lambda store, company: calls.append(company) or 3)
+    monkeypatch.setattr(cli, 'build_model', lambda *a, **k: pytest.fail('rollback loaded model'))
+    args = cli.parser().parse_args(['--config', 'unused', 'index-rollback-legacy'])
+    assert await cli.execute(args, settings) == 0
+    assert calls == ['company']
+    assert json.loads(capsys.readouterr().out)['legacy_chunks_materialized'] == 3
+
+
 @pytest.fixture
 def runtime(monkeypatch):
     Store.instances = []

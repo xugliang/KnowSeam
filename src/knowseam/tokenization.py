@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+from importlib import metadata
+from functools import lru_cache
 import hashlib
 import io
 import json
@@ -24,6 +26,19 @@ HAS_WORD = re.compile(r"[\w]", re.UNICODE)
 
 class TokenizationError(KnowledgeError):
     pass
+
+
+@lru_cache(maxsize=1)
+def runtime_fingerprint():
+    try:
+        distribution = metadata.distribution('jieba')
+        dictionary = distribution.locate_file('jieba/dict.txt')
+        checksum = hashlib.sha256(Path(dictionary).read_bytes()).hexdigest()
+        return {'jieba_version': distribution.version, 'default_dictionary': checksum,
+                'implementation': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    except (metadata.PackageNotFoundError, OSError):
+        # Initialization still fails closed before segmentation; no substitute tokenizer.
+        return {'runtime': 'unavailable'}
 
 
 class JiebaTokenizer:
@@ -89,7 +104,8 @@ class JiebaTokenizer:
                 raise TokenizationError("user dictionary must be a readable UTF-8 file of at most 10 MiB") from None
             dictionary_hash = hashlib.sha256(dictionary_bytes).hexdigest()
         fingerprint_data = {"algorithm": TOKENIZER_ALGORITHM_VERSION, "terms": self._terms,
-                            "dictionary_sha256": dictionary_hash}
+                            "dictionary_sha256": dictionary_hash, 'runtime': runtime_fingerprint(),
+                            'max_chars': max_chars, 'max_tokens': max_tokens}
         if self._glossary:
             fingerprint_data["glossary"] = self._glossary
         fingerprint = json.dumps(fingerprint_data,

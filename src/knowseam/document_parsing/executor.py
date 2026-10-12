@@ -33,9 +33,15 @@ def create_executor_app(settings: ExecutorSettings, *, runner):
     busy = threading.Lock()
 
     async def status(request):
-        return JSONResponse(settings.identity.model_dump())
+        version = 2 if request.url.path.startswith('/v2/') else 1
+        if version > settings.identity.protocol_version:
+            return JSONResponse({'error': 'parser_protocol_unsupported'}, status_code=404)
+        return JSONResponse(settings.identity.model_copy(update={'protocol_version': version}).model_dump())
 
     async def parse(request: Request):
+        version = 2 if request.url.path.startswith('/v2/') else 1
+        if version > settings.identity.protocol_version:
+            return JSONResponse({'error': 'parser_protocol_unsupported'}, status_code=404)
         try:
             metadata = decode_metadata(request.headers.get(HEADER, ''), max_bytes=settings.max_metadata_bytes)
             options = metadata.options
@@ -55,6 +61,8 @@ def create_executor_app(settings: ExecutorSettings, *, runner):
             return JSONResponse({'error': 'parser_busy'}, status_code=429)
         def run_and_release():
             try:
+                if callable(getattr(runner, 'run_versioned', None)):
+                    return runner.run_versioned(SourceContent(bytes(body), metadata.filename, metadata.media_type), options, version)
                 return runner.run(SourceContent(bytes(body), metadata.filename, metadata.media_type), options)
             finally:
                 busy.release()
@@ -63,16 +71,17 @@ def create_executor_app(settings: ExecutorSettings, *, runner):
         running = asyncio.create_task(asyncio.to_thread(run_and_release))
         try:
             result = await asyncio.shield(running)
-            output = encode_document(result)
+            output = encode_document(result, protocol_version=version)
             if len(output) > settings.max_response_bytes:
                 raise UnsupportedDocument('parser_response_limit')
-            decode_document(output, max_sections=options.max_sections, max_text_chars=settings.max_text_chars)
+            decode_document(output, max_sections=options.max_sections, max_text_chars=settings.max_text_chars, protocol_version=version)
             return Response(output, media_type='application/json')
         except Exception as error:
             category = 'parser_timeout' if isinstance(error, UnsupportedDocument) and str(error) == 'parser_timeout' else 'parser_execution_failed'
             return JSONResponse({'error': category}, status_code=504 if category == 'parser_timeout' else 422)
 
-    return Starlette(routes=[Route('/v1/status', status), Route('/v1/parse', parse, methods=['POST'])])
+    return Starlette(routes=[Route('/v1/status', status), Route('/v1/parse', parse, methods=['POST']),
+                             Route('/v2/status', status), Route('/v2/parse', parse, methods=['POST'])])
 
 
 def validate_socket_target(path: Path):
@@ -102,7 +111,7 @@ def load_identity(model_path: Path) -> ParserIdentity:
     build = load_json(Path('/app/parser-build.json').read_bytes())
     if installed_runtime_hash() != build['runtime_source_sha256']:
         raise ValueError('installed runtime differs from build identity')
-    return ParserIdentity(upstream_sha=build['upstream_sha'],
+    return ParserIdentity(protocol_version=2, upstream_sha=build['upstream_sha'],
                           runtime_source_sha256=build['runtime_source_sha256'],
                           dependency_fingerprint=build['dependency_fingerprint'],
                           model_fingerprint=model_manifest_hash(model_path, verify=True),

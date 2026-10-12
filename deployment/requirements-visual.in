@@ -1,0 +1,15 @@
+# Dedicated CPU baseline; never install this into the text/parser environment.
+# Resolve to requirements-visual.lock with uv pip compile and SHA256 hashes.
+--extra-index-url https://download.pytorch.org/whl/cpu
+colpali-engine==0.3.13
+torch==2.8.0+cpu
+torchvision==0.23.0+cpu
+transformers==4.57.3
+peft==0.17.1
+accelerate==1.8.1
+Pillow==11.3.0
+numpy==2.2.6
+pydantic==2.11.7
+starlette==0.47.3
+uvicorn==0.35.0
+httpx==0.28.1

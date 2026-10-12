@@ -7,9 +7,10 @@ import mimetypes
 from pathlib import Path
 
 from ..domain import AccessDenied, NotFound, SourceConnector, SourceContent, SourceNode, SourceSnapshot
+from ..permissions.domain import PermissionConnector, public_snapshot
 
 
-class FilesystemConnector(SourceConnector):
+class FilesystemConnector(SourceConnector, PermissionConnector):
     def __init__(self, root: str | Path, *, public_files: tuple[str, ...] = (),
                  max_download_bytes: int = 30 * 1024 * 1024):
         self.root = Path(root).resolve(strict=True)
@@ -54,6 +55,15 @@ class FilesystemConnector(SourceConnector):
             except (OSError, AccessDenied) as exc:
                 errors.append(f"{relative}: {type(exc).__name__}")
         return SourceSnapshot(tuple(nodes), not errors, tuple(errors))
+
+    async def fetch_permissions(self, external_ids):
+        import asyncio
+        def check(relative):
+            try:
+                return public_snapshot(relative, self._path(relative).is_file())
+            except (OSError, AccessDenied):
+                return public_snapshot(relative, False)
+        return tuple(await asyncio.gather(*(asyncio.to_thread(check, value) for value in external_ids)))
 
     async def fetch(self, node: SourceNode) -> SourceContent:
         if node.public is not True:

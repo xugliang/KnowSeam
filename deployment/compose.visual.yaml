@@ -1,0 +1,49 @@
+# Opt-in overlay: docker compose -f compose.yaml -f compose.visual.yaml ...
+# Set the socket directory owner/mode once to 10001:10001/0700.
+# No GPU requests or implicit downloads; choose/approve resource limits explicitly.
+services:
+  api:
+    volumes:
+      - ${KNOWSEAM_VISUAL_SOCKET_DIR:?private socket directory required}:/run/knowseam-visual
+  worker:
+    volumes:
+      - ${KNOWSEAM_VISUAL_SOCKET_DIR:?private socket directory required}:/run/knowseam-visual
+  visual-worker:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile
+      args:
+        KNOWSEAM_EXTRAS: mcp,graph,visual-render
+    image: knowseam-visual-worker:0.1.0
+    command: ["--config", "/private/core.json", "visual-worker"]
+    volumes:
+      - ../secrets/core.json:/private/core.json:ro
+      - ../data:/app/data:ro
+      - ${KNOWSEAM_VISUAL_SOCKET_DIR:?private socket directory required}:/run/knowseam-visual
+    read_only: true
+    tmpfs: ["/tmp:size=256m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KNOWSEAM_VISUAL_WORKER_MEMORY:?explicit worker limit required}
+    cpus: ${KNOWSEAM_VISUAL_WORKER_CPUS:?explicit worker limit required}
+    pids_limit: 128
+    restart: unless-stopped
+  visual-runtime:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.visual
+    image: knowseam-visual-runtime:0.1.0
+    command: ["--config", "/private/visual.json"]
+    network_mode: none
+    volumes:
+      - ../secrets/visual.json:/private/visual.json:ro
+      - ${KNOWSEAM_VISUAL_MODEL_DIR:?approved offline model directory required}:/models/visual:ro
+      - ${KNOWSEAM_VISUAL_SOCKET_DIR:?private socket directory required}:/run/knowseam-visual
+    read_only: true
+    tmpfs: ["/tmp:size=256m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: ${KNOWSEAM_VISUAL_RUNTIME_MEMORY:?explicit model limit required}
+    cpus: ${KNOWSEAM_VISUAL_RUNTIME_CPUS:?explicit model limit required}
+    pids_limit: 256
+    restart: unless-stopped

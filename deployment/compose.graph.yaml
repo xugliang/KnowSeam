@@ -1,0 +1,60 @@
+# Explicit graph enhanced mode, never loaded by the standard compose file.
+services:
+  api:
+    build:
+      args:
+        KNOWSEAM_EXTRAS: mcp,graph
+    image: knowseam:0.1.0-graph
+  worker:
+    image: knowseam:0.1.0-graph
+  mcp:
+    image: knowseam:0.1.0-graph
+  neo4j:
+    image: neo4j:5.26.32-community
+    profiles: [graph]
+    environment:
+      NEO4J_AUTH_FILE: /run/secrets/neo4j_auth
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 512M
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_db_transaction_timeout: 30s
+    secrets: [neo4j_auth]
+    volumes: [neo4j-data:/data]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          IFS=/ read -r NEO4J_USERNAME NEO4J_PASSWORD < "$$NEO4J_AUTH_FILE";
+          export NEO4J_USERNAME NEO4J_PASSWORD;
+          cypher-shell -a bolt://localhost:7687 -d neo4j --format plain 'RETURN 1' >/dev/null
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    security_opt: ["no-new-privileges:true"]
+    # No host Bolt/browser port: do not expose the graph's privileged raw data.
+  graph-worker:
+    profiles: [graph]
+    image: knowseam:0.1.0-graph
+    command: ["--config", "/private/core.json", "graph-worker"]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes: ["../secrets/core.json:/private/core.json:ro"]
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1
+    pids_limit: 128
+secrets:
+  neo4j_auth:
+    file: ../secrets/neo4j-auth.txt
+volumes:
+  neo4j-data:

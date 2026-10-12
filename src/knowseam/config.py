@@ -14,9 +14,14 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
 from .document_parsing.config import ParsingConfig
+from .graph.config import GraphConfig
+from .catalog.domain import CatalogConfig
+from .identifiers import ID_PATTERN, Identifier
+from .coverage import CoverageConfig
+from .indexing.cache import IndexingConfig
+from .permissions.domain import PermissionsConfig, SubjectBinding
+from .visual.domain import VisualConfig
 
-ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-Identifier = Annotated[str, Field(strict=True, pattern=ID_PATTERN, min_length=1, max_length=128)]
 MAX_CONFIG_BYTES = 1024 * 1024
 
 
@@ -223,6 +228,7 @@ class FilesystemSourceConfig(_Strict):
     collection_id: Identifier
     root: Path
     public_files: tuple[str, ...] = ()
+    permission_mode: Literal['public_verified'] = 'public_verified'
     max_download_bytes: Annotated[int, Field(strict=True, ge=1, le=100 * 1024 * 1024)] = 30 * 1024 * 1024
 
     @field_validator("public_files")
@@ -243,6 +249,8 @@ class FeishuSourceConfig(_Strict):
     type: Literal["feishu"]
     id: Identifier
     collection_id: Identifier
+    permission_mode: Literal['public_verified', 'source_acl'] = 'public_verified'
+    bindings: Annotated[tuple['SubjectBinding', ...], Field(max_length=10000)] = ()
     app_id: Annotated[str, Field(strict=True, min_length=1, max_length=128)]
     app_secret: SecretStr = Field(repr=False)
     root_token: Annotated[str, Field(strict=True, pattern=r"^[A-Za-z0-9_-]{1,200}$")]
@@ -272,6 +280,23 @@ class FeishuSourceConfig(_Strict):
 SourceConfig = Annotated[FilesystemSourceConfig | FeishuSourceConfig, Field(discriminator="type")]
 
 
+
+
+class ObservabilityConfig(_Strict):
+    enabled: Annotated[bool, Field(strict=True)] = False
+    diagnostic_actor_ids: Annotated[tuple[Identifier, ...], Field(max_length=10000)] = ()
+
+
+class FeaturesConfig(_Strict):
+    catalog: Annotated[bool, Field(strict=True)] = False
+    context: Annotated[bool, Field(strict=True)] = False
+    tables: Annotated[bool, Field(strict=True)] = False
+    coverage: Annotated[bool, Field(strict=True)] = False
+    history: Annotated[bool, Field(strict=True)] = False
+    visual: Annotated[bool, Field(strict=True)] = False
+    query_graph: Annotated[bool, Field(strict=True)] = False
+
+
 class Settings(_Strict):
     environment: Literal["production", "development", "test"] = "production"
     dsn: SecretStr = Field(repr=False)
@@ -283,6 +308,14 @@ class Settings(_Strict):
     models: ModelsConfig
     tokenization: TokenizationConfig = Field(default_factory=TokenizationConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
+    graph: GraphConfig = Field(default_factory=GraphConfig)
+    features: FeaturesConfig = Field(default_factory=FeaturesConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    catalog: CatalogConfig = Field(default_factory=CatalogConfig)
+    coverage: CoverageConfig = Field(default_factory=CoverageConfig)
+    indexing: IndexingConfig = Field(default_factory=IndexingConfig)
+    permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
+    visual: VisualConfig = Field(default_factory=VisualConfig)
     sources: Annotated[tuple[SourceConfig, ...], Field(max_length=1000)] = ()
     sync_interval_seconds: Annotated[int, Field(strict=True, ge=1, le=86400)] = 300
     acl_ttl_seconds: Annotated[int, Field(strict=True, ge=30, le=86400)] = 900
@@ -315,8 +348,19 @@ class Settings(_Strict):
                 or any(character.isspace() or ord(character) < 32 for character in dsn)):
             raise ValueError("dsn must be a PostgreSQL connection URI")
         collections = {item.id for item in self.collections}
+        if self.features.visual != self.visual.enabled:
+            raise ValueError('visual_feature_and_runtime_must_be_explicitly_enabled_together')
+        if self.features.visual and not self.permissions.enabled:
+            raise ValueError('visual_requires_versioned_permission_authority')
         if len(collections) != len(self.collections):
             raise ValueError("collection ids must be unique")
+        if not set(self.graph.collections).issubset(collections):
+            raise ValueError("graph ontology refers to an unknown collection")
+        if self.features.query_graph and (not self.graph.collections or self.graph.extractor is None):
+            raise ValueError('query_graph_requires_fact_ontology_and_extractor')
+        if ((self.features.history or self.features.query_graph) and self.graph.extractor is not None
+                and self.graph.lease_seconds < 4*self.graph.extractor.timeout+30):
+            raise ValueError('fact_lease_must_cover_extraction_deadline')
         if len({item.actor_id for item in self.employees}) != len(self.employees):
             raise ValueError("employee ids must be unique")
         if len({item.id for item in self.sources}) != len(self.sources):
@@ -332,6 +376,17 @@ class Settings(_Strict):
                 raise ValueError("placeholder service tokens are forbidden in production")
         if self.acl_ttl_seconds < self.sync_interval_seconds:
             raise ValueError("ACL TTL must cover at least one sync interval")
+        if self.permissions.enabled and self.permissions.interval_seconds >= self.acl_ttl_seconds:
+            raise ValueError('permission interval must be strictly less than ACL TTL')
+        if not self.permissions.enabled and any(s.permission_mode != 'public_verified' for s in self.sources):
+            raise ValueError('source_acl requires permissions.enabled')
+        actors = {e.actor_id for e in self.employees}
+        for source in self.sources:
+            bindings = getattr(source, 'bindings', ())
+            if any(b.actor_id not in actors for b in bindings):
+                raise ValueError('source binding requires configured employee')
+            if len({(b.actor_id, b.kind, b.subject_id) for b in bindings}) != len(bindings):
+                raise ValueError('duplicate source subject binding')
         return self
 
 
@@ -395,6 +450,9 @@ def load_config(path: str | Path) -> Settings:
         if "file_root" in values:
             values["file_root"] = _resolve_path(values["file_root"], base, write_root=True)
         tokenization = values.get("tokenization")
+        visual = values.get('visual')
+        if isinstance(visual,dict) and visual.get('model_path') is not None:
+            visual['model_path'] = _resolve_path(visual['model_path'],base)
         if isinstance(tokenization, dict) and tokenization.get("user_dictionary") is not None:
             tokenization["user_dictionary"] = _resolve_path(tokenization["user_dictionary"], base, regular_file=True)
         models = values.get("models")

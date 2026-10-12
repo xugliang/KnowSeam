@@ -31,9 +31,8 @@ class Client:
             raise UnsupportedDocument('parser_timeout')
         result = StructuredDocumentParser().parse(content)
         from knowseam.document_parsing.fingerprint import parser_fingerprint
-        from knowseam.document_parsing.normalizer import NORMALIZER_VERSION
         return replace(result, parser_version=parser_fingerprint(self.identity, options,
-                       normalizer_version=NORMALIZER_VERSION))
+                       normalizer_version=self.identity.normalizer_version))
 
 
 def test_docling_pipeline_change_reindexes_without_reembedding(case):
